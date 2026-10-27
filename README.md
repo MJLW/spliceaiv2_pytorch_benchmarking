@@ -98,6 +98,86 @@ instead of silently skewing the numbers.
 Sequences are random ACGT with the GRCh38 species channel; runtime does not
 depend on sequence content.
 
+## Single-base substitutions
+
+```bash
+uv run spliceai2-mutbench                       # reference + 99 substitutions
+uv run spliceai2-mutbench --variant-batch-size 33 --json-out mut.json
+```
+
+`spliceai2_bench.incremental.IncrementalEnsemble` scores single-base
+substitutions against a cached reference.
+
+- **How it works:** a substitution can only change activations inside a cone
+  that widens block by block. For the released models that is ±56,480 nt
+  after the last block, within the 65,536 nt flank.
+  - One full pass of the reference keeps every block's pooled output.
+  - Each variant then recomputes only its cone (about 1.8% of a full pass's
+    block positions at 100k).
+  - Everything outside the cone comes from the cache.
+- **What it returns:** the full 1D track and the 2D head with each variant's
+  own top-k sites. Both equal a full forward pass on the variant sequence, up
+  to floating-point rounding.
+- **Two rewrites, both exact in exact arithmetic:**
+  - Splice-site heads are applied before the linear upsampling.
+  - Junction-head features are interpolated straight from the pooled block
+    outputs.
+- **Cache size:** under 1 GiB per model at 100k positions. In a 16k run,
+  peak memory was 2.6 GiB with the reference cache and a full pass's cache
+  both resident.
+
+The benchmark runs two workloads, interleaved as above:
+
+- **full:** a complete forward pass for the reference and for each variant
+  sequence, batch 1.
+- **incremental:** one reference pass, then the variants in batches of
+  `--variant-batch-size`.
+
+Both workloads use the same code paths, so the comparison isolates the
+recomputation that is saved. Before timing, it checks:
+
+- each variant's incremental prediction against its full pass;
+- both paths against the original `Ensemble` code, on a short sequence in
+  eager mode.
+
+## Full suite (one command)
+
+```bash
+uv run spliceai2-suite                     # on a GPU machine
+sbatch scripts/h100_suite.sbatch           # on a SLURM cluster; adjust #SBATCH lines
+```
+
+By default every benchmark makes 500 predictions of 100,000 positions:
+
+| Benchmark | Command used | Workload |
+|---|---|---|
+| fixed | `spliceai2-bench` | 500 sequences × 100k; once per `--fixed-batch-sizes` entry (default 1 and 8) |
+| variable | `spliceai2-bench` | 500 sequences, lengths ~ N(100k, 10k), bucketed |
+| random substitutions | `spliceai2-mutbench --layout random` | reference + 499 substitutions at random positions |
+| consecutive substitutions | `spliceai2-mutbench --layout consecutive` | reference + 499 substitutions at adjacent positions |
+
+- **Defaults for an H100:** the incremental workloads run variants in
+  batches of `--variant-batch-size` (default 100).
+- **Isolation:** each benchmark runs in its own process.
+- **Output:** each benchmark's JSON and log, plus `summary.md` and
+  `summary.json`, go to `results/suite-<timestamp>/` (or `--out-dir`).
+- **Failures:** if one benchmark fails, it is marked in the summary and the
+  suite carries on with the next.
+- **Time on an H100:** I estimate about an hour. About a third of that is
+  the first-time `torch.compile` of each graph, which the on-disk compile
+  cache speeds up on later runs.
+
+If the cluster's compute nodes have no internet, download the weights on a
+login node first:
+
+```bash
+uv run hf auth login
+uv run python -c "from spliceai2_bench.weights import download_models; print(download_models())"
+```
+
+Then either pass the printed folder as `--model-dir`, or share `HF_HOME`
+with the compute nodes.
+
 ## Tests
 
 ```bash

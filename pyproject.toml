@@ -13,6 +13,8 @@ dependencies = [
 
 [project.scripts]
 spliceai2-bench = "spliceai2_bench.benchmark:main"
+spliceai2-mutbench = "spliceai2_bench.mutation_benchmark:main"
+spliceai2-suite = "spliceai2_bench.suite:main"
 
 [dependency-groups]
 dev = ["pytest>=8"]
