@@ -72,6 +72,17 @@ NAME	CHROM	STRAND	TX_START	TX_END
 BRCA1	chr17	-	43044295	43125483
 ```
 
+To make it for all protein-coding genes of a GENCODE GFF3 (plain or gzipped):
+
+```bash
+uv run spliceai2-regions gencode.v49.annotation.gff3.gz -o genes.tsv
+```
+
+It writes one row per `gene` feature with `gene_type=protein_coding`, using
+the gene's span (all of its transcripts). Names are `gene_name`; a name that
+occurs more than once (e.g. pseudoautosomal genes, which are on both chrX and
+chrY) becomes `gene_name_gene_id` for each of those genes.
+
 **Variants** (`--variants`), one row per variant of a haplotype; `POS`
 1-based, REF and ALT as in VCF:
 

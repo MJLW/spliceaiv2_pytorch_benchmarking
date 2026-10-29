@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 spliceai2-ism = "spliceai2_ism.ism:main"
+spliceai2-regions = "spliceai2_ism.gencode:main"
 spliceai2-bench = "spliceai2_bench.benchmark:main"
 spliceai2-mutbench = "spliceai2_bench.mutation_benchmark:main"
 spliceai2-suite = "spliceai2_bench.suite:main"
