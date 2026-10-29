@@ -1,7 +1,8 @@
 """In-silico saturation mutagenesis (ISM) of gene haplotypes with SpliceAI2.
 
-For every haplotype (gene + group of variants from the variant TSV; SNVs,
-MNVs and indels) this runs one full prediction of the haplotype sequence,
+For every gene in the variant TSV, first its reference sequence, then each
+of its haplotypes (gene + group of variants; SNVs, MNVs and indels), this
+runs one full prediction of the haplotype sequence,
 then scores every possible SNV in the haplotype's gene body (three per base)
 against it with
 ``IncrementalEnsemble``: each SNV recomputes only the part of the network it
@@ -249,7 +250,7 @@ def run_ism(inc, regions, haplotypes, writer, device, *, compile_=True,
             st = run_haplotype(inc, stages, region, hap, writer, device,
                                batch_size, min_delta, log)
             batch_size = st["batch_size"]
-            log(f"  group {hap.group}: {st['variants']} variants, "
+            log(f"  {hap.group}: {st['variants']} variants, "
                 f"{st['gene_len']:,} nt gene body, "
                 f"{st['snvs']:,} SNVs in {st['seconds']:.1f} s "
                 f"({st['snvs'] / st['seconds']:,.0f} SNVs/s)", flush=True)

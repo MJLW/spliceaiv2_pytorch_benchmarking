@@ -16,7 +16,8 @@ probability changes by at least --min-delta:
   donor_reference_pos, donor_haplotype_pos, acceptor_reference_pos,
   acceptor_haplotype_pos, delta
 
-Positions are 1-based, forward strand. reference_pos is the GRCh38
+group is the variant TSV's group id, or "reference" for the gene's
+reference sequence. Positions are 1-based, forward strand. reference_pos is the GRCh38
 position, null for bases the haplotype inserts; haplotype_pos is the
 position on the haplotype's own chromosome (see sequence.py). snv_ref is
 the haplotype's base, so at a haplotype variant it is the ALT allele.
@@ -28,7 +29,7 @@ import pyarrow.parquet as pq
 
 from spliceai2_ism.inputs import BASES
 
-_HAPLOTYPE = [("gene", pa.string()), ("group", pa.int32())]
+_HAPLOTYPE = [("gene", pa.string()), ("group", pa.string())]
 _SNV = [("snv_reference_pos", pa.int64()), ("snv_haplotype_pos", pa.int64()),
         ("snv_ref", pa.string()), ("snv_alt", pa.string())]
 _SITE = [("reference_pos", pa.int64()), ("haplotype_pos", pa.int64())]
@@ -60,7 +61,7 @@ def _labels(codes, labels):
 
 def _haplotype(window, group, n):
     return [_labels(np.zeros(n, dtype=np.int32), [window.gene.name]),
-            pa.array(np.full(n, group, np.int32))]
+            _labels(np.zeros(n, dtype=np.int32), [group])]
 
 
 def _positions(window, idx):

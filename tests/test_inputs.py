@@ -1,6 +1,11 @@
 import pytest
 
-from spliceai2_ism.inputs import InputError, read_haplotypes, read_regions
+from spliceai2_ism.inputs import (
+    REFERENCE,
+    InputError,
+    read_haplotypes,
+    read_regions,
+)
 
 REGIONS = ("NAME\tCHROM\tSTRAND\tTX_START\tTX_END\n"
            "G1\tchr1\t+\t301\t400\nG2\tchr1\t-\t501\t620\n")
@@ -37,29 +42,22 @@ def test_bad_strand(tmp_path):
 def test_haplotypes_grouped_and_sorted(tmp_path, genes):
     haps = read_haplotypes(variants(
         tmp_path,
-        "chr1\t350\tA\tG\t0\tG1",
-        "chr1\t320\tc\tt\t0\tG1",
-        "chr1\t330\tA\tC\t1\tG1",
+        "chr1\t350\tA\tG\tHG002.1\tG1",
+        "chr1\t320\tc\tt\tHG002.1\tG1",
+        "chr1\t330\tA\tC\t7\tG1",
+        "chr1\t510\tA\tC\t7\tG2",  # same id in another gene: another haplotype
     ), genes)
-    assert [h.group for h in haps["G1"]] == [0, 1]
-    assert [v.pos for v in haps["G1"][0].variants] == [320, 350]
-    assert haps["G1"][0].variants[0].ref == "C"  # upper-cased
-    assert "G2" not in haps
-
-
-def test_group_zero_is_reference_when_ids_start_at_one(tmp_path, genes):
-    haps = read_haplotypes(variants(
-        tmp_path, "chr1\t330\tA\tC\t1\tG1", "chr1\t340\tA\tC\t2\tG1",
-    ), genes)
-    assert [h.group for h in haps["G1"]] == [0, 1, 2]
+    # the reference first, then the groups in order of first appearance
+    assert [h.group for h in haps["G1"]] == [REFERENCE, "HG002.1", "7"]
     assert haps["G1"][0].variants == ()
+    assert [v.pos for v in haps["G1"][1].variants] == [320, 350]
+    assert haps["G1"][1].variants[0].ref == "C"  # upper-cased
+    assert [h.group for h in haps["G2"]] == [REFERENCE, "7"]
 
 
-def test_gap_in_group_ids(tmp_path, genes):
-    with pytest.raises(InputError, match="missing 1"):
-        read_haplotypes(variants(
-            tmp_path, "chr1\t330\tA\tC\t0\tG1", "chr1\t340\tA\tC\t2\tG1",
-        ), genes)
+def test_genes_without_variants_have_no_haplotypes(tmp_path, genes):
+    haps = read_haplotypes(variants(tmp_path, "chr1\t330\tA\tC\ta\tG1"), genes)
+    assert "G2" not in haps
 
 
 def test_indels_and_mnvs_accepted(tmp_path, genes):
@@ -69,7 +67,7 @@ def test_indels_and_mnvs_accepted(tmp_path, genes):
         "chr1\t340\tACGT\tA\t0\tG1",  # deletion
         "chr1\t350\tAC\tGT\t0\tG1",   # MNV
     ), genes)
-    assert [(v.ref, v.alt) for v in haps["G1"][0].variants] == [
+    assert [(v.ref, v.alt) for v in haps["G1"][1].variants] == [
         ("A", "ATG"), ("ACGT", "A"), ("AC", "GT")]
 
 
@@ -92,7 +90,8 @@ def test_overlapping_variants(tmp_path, genes):
     ("chr2\t330\tA\tC\t0\tG1", "differs from"),
     ("chr1\t330\tA\tC\t0\tG9", "not in the region file"),
     ("chr1\tx\tA\tC\t0\tG1", "POS must be an integer"),
-    ("chr1\t330\tA\tC\t-1\tG1", "group must be >= 0"),
+    ("chr1\t330\tA\tC\t\tG1", "empty group"),
+    ("chr1\t330\tA\tC\treference\tG1", "reserved for the reference"),
 ])
 def test_rejected_variants(tmp_path, genes, row, message):
     with pytest.raises(InputError, match=message):

@@ -11,7 +11,7 @@ from helpers import CROP_LEN, small_models
 from spliceai2_ism import ism
 from spliceai2_ism.encode import one_hot_encode, random_sequences
 from spliceai2_ism.incremental import IncrementalEnsemble
-from spliceai2_ism.inputs import Gene, Haplotype, Variant
+from spliceai2_ism.inputs import REFERENCE, Gene, Haplotype, Variant
 from spliceai2_ism.ism import prepare_regions, run_ism
 from spliceai2_ism.output import SCHEMAS, Writer
 from spliceai2_ism.predict import predict_full
@@ -42,20 +42,21 @@ def dele(pos, n):
     return Variant("chr1", pos, CHROM[pos - 1:pos + n], CHROM[pos - 1], 0)
 
 
-HAPLOTYPES = {
-    # G1: ids start at 1, so group 0 is the reference
-    "G1": [Haplotype("G1", 0, ()),
-           Haplotype("G1", 1, (snv(320),            # flank
-                               ins(430, "GT"),      # gene
-                               snv(450, 2),         # gene
-                               dele(460, 2)))],     # gene: 461-462 deleted
-    "G2": [Haplotype("G2", 0, (snv(850),)),
-           Haplotype("G2", 1, (dele(700, 4),        # flank, before the gene
-                               ins(880, "A"),       # gene
-                               ins(920, "CC"),      # after TX_END: flank
-                               snv(1000, 3)))],     # flank
-    "G3": [Haplotype("G3", 0, (snv(1205),)),
-           Haplotype("G3", 1, (dele(1203, 2),))],   # 1204-1205 deleted
+HAPLOTYPES = {  # as read_haplotypes returns them: the reference first
+    "G1": [Haplotype("G1", REFERENCE, ()),
+           Haplotype("G1", "indels", (snv(320),        # flank
+                                      ins(430, "GT"),  # gene
+                                      snv(450, 2),     # gene
+                                      dele(460, 2)))],  # gene: 461-462 deleted
+    "G2": [Haplotype("G2", REFERENCE, ()),
+           Haplotype("G2", "snv", (snv(850),)),
+           Haplotype("G2", "indels", (dele(700, 4),    # flank, before the gene
+                                      ins(880, "A"),   # gene
+                                      ins(920, "CC"),  # after TX_END: flank
+                                      snv(1000, 3)))],  # flank
+    "G3": [Haplotype("G3", REFERENCE, ()),
+           Haplotype("G3", "snv", (snv(1205),)),
+           Haplotype("G3", "indels", (dele(1203, 2),))],  # 1204-1205 deleted
 }
 
 
@@ -194,12 +195,12 @@ def test_haplotype_predictions_match_full_pass(outputs, gene):
 
 def test_indel_coordinates(outputs):
     _, tables, _ = outputs
-    sites, _ = predictions(tables, "G1", 1)
+    sites, _ = predictions(tables, "G1", "indels")
     # +2 inserted after 430, -2 deleted after 460
     assert {(430, 430), (None, 431), (None, 432), (431, 433), (460, 462),
             (463, 463)} <= set(sites)
     assert not any(r in (461, 462) for r, _ in sites)
-    sites, _ = predictions(tables, "G2", 1)
+    sites, _ = predictions(tables, "G2", "indels")
     # -4 deleted after 700 shifts the whole gene; +1 inserted after 880
     assert {(801, 797), (880, 876), (None, 877), (881, 878),
             (920, 917)} <= set(sites)
@@ -244,16 +245,24 @@ def test_every_snv_scored(outputs):
     _, tables, stats = outputs
     for st in stats:  # no N in the test chromosome
         assert st["snvs"] == 3 * st["gene_len"]
-    seq, coords, anchor = build(HAPLOTYPES["G2"][1])
+    seq, coords, anchor = build(HAPLOTYPES["G2"][2])
     b0, b1 = gene_body(GENES[1], coords, anchor)
-    rows = select(tables["deltas_sites"], gene="G2", group=1)
+    rows = select(tables["deltas_sites"], gene="G2", group="indels")
     snvs = set(zip(rows["snv_reference_pos"], rows["snv_haplotype_pos"],
                    rows["snv_alt"]))
     assert len(snvs) == 3 * (b1 - b0)
     assert {(r, h) for r, h, _ in snvs} == set(coords[b0:b1])
     # SNV alleles are forward-strand bases, never the haplotype's own base
     assert all(alt != seq[h - 1] for _, h, alt in snvs)
-    assert [st["variants"] for st in stats] == [0, 4, 1, 4, 1, 1]
+    assert [(st["gene"], st["group"], st["variants"]) for st in stats] == [
+        ("G1", REFERENCE, 0), ("G1", "indels", 4),
+        ("G2", REFERENCE, 0), ("G2", "snv", 1), ("G2", "indels", 4),
+        ("G3", REFERENCE, 0), ("G3", "snv", 1), ("G3", "indels", 1)]
+    # the references are in the tables with the other haplotypes
+    groups = set(zip(*(tables["predictions_sites"][c].to_pylist()
+                       for c in ("gene", "group"))))
+    assert groups == {(g, h.group) for g, haps in HAPLOTYPES.items()
+                      for h in haps}
     assert np.isfinite(rows["donor_delta"]).all()
 
 

@@ -20,7 +20,7 @@ CROP, MIN_OUT, BUCKET, ALIGN = 40, 4, 16, 2
 
 
 def region(gene, *variants):
-    return read_region(FASTA, gene, [Haplotype(gene.name, 0, variants)],
+    return read_region(FASTA, gene, [Haplotype(gene.name, "h", variants)],
                        CROP, MIN_OUT, BUCKET, ALIGN)
 
 

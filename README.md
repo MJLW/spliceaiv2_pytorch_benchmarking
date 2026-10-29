@@ -88,18 +88,20 @@ chrY) becomes `gene_name_gene_id` for each of those genes.
 
 ```
 CHROM	POS	REF	ALT	group	gene
-chr17	43045000	A	G	1	BRCA1
-chr17	43071077	T	TGA	1	BRCA1
-chr17	43045000	A	G	2	BRCA1
-chr17	43090010	CAGT	C	2	BRCA1
+chr17	43045000	A	G	HG002.1	BRCA1
+chr17	43071077	T	TGA	HG002.1	BRCA1
+chr17	43045000	A	G	HG002.2	BRCA1
+chr17	43090010	CAGT	C	HG002.2	BRCA1
 ```
 
 - A haplotype is a `(gene, group)` pair: all of that group's variants in
   that gene, applied together.
 - `gene` must match a `NAME` in the region file.
-- Group ids per gene run 0, 1, 2, ... If they start at 1, group 0 is the
-  haplotype without variants (the reference sequence). Other gaps are an
-  error.
+- Group ids are any non-empty strings. Together with the gene they identify
+  a haplotype, so the same id in two genes is two haplotypes.
+- Each gene first runs its reference sequence (no variants), as group
+  `reference`, then its haplotypes in order of first appearance. The id
+  `reference` is reserved.
 - The genes that run are the ones in this file's `gene` column. The region
   file is only looked up for their coordinates, so it can be a full
   annotation; genes without variants are not run.
@@ -142,6 +144,9 @@ T `(null, 1001)`, G `(null, 1002)`, and the next reference base
 `reference_pos`. A haplotype's gene body is its bases at
 `TX_START`–`TX_END`, plus bases inserted after `TX_START`–`TX_END − 1`; an
 insertion right after `TX_END` is flank.
+
+All four tables include each gene's reference sequence as group
+`reference`, alongside the haplotypes from the variant TSV.
 
 **`predictions_sites.parquet`**: one row per gene-body base of each
 haplotype.
@@ -189,7 +194,7 @@ Example, with DuckDB:
 ```sql
 SELECT snv_reference_pos, snv_alt, reference_pos, donor_delta, acceptor_delta
 FROM 'results/ism-run1/deltas_sites.parquet'
-WHERE gene = 'BRCA1' AND "group" = 1
+WHERE gene = 'BRCA1' AND "group" = 'HG002.1'
 ORDER BY greatest(abs(donor_delta), abs(acceptor_delta)) DESC LIMIT 20;
 ```
 

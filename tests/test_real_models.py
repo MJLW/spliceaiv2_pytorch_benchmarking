@@ -50,7 +50,7 @@ def test_snv_deltas_match_full_passes(models, strand, compile_):
     # an SNV, an 8 nt insertion and an 8 nt deletion in the gene; the gene
     # body keeps its length, so input lengths stay divisible by the pooling
     s, i, d = gene.start + 5_000, gene.start + 9_000, gene.start + 12_000
-    hap = Haplotype("G", 0, (
+    hap = Haplotype("G", "h", (
         Variant("chr1", s, at(s), "C" if at(s) == "A" else "A", 0),
         Variant("chr1", i, at(i), at(i) + "ACGTTGCA", 0),
         Variant("chr1", d, at(d, 9), at(d), 0),

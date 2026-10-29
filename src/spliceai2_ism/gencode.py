@@ -67,7 +67,10 @@ def main(argv=None):
     p.add_argument("-o", "--out", help="output TSV (default: stdout)")
     args = p.parse_args(argv)
 
-    rows, duplicated = regions(read_genes(args.gff))
+    try:
+        rows, duplicated = regions(read_genes(args.gff))
+    except FileNotFoundError as e:
+        sys.exit(f"{e.filename}: no such file")
     if not rows:
         sys.exit(f"{args.gff}: no protein-coding genes "
                  f"(expected GENCODE GFF3 with gene_type attributes)")

@@ -6,8 +6,9 @@ Variant TSV columns: CHROM, POS, REF, ALT, group, gene (POS 1-based).
 Header names are case-insensitive and may start with '#'.
 
 A haplotype is (gene, group): all variants of that group in that gene,
-applied together. Group ids per gene run 0, 1, 2, ...; if they start at 1,
-group 0 is the haplotype without variants (the reference sequence).
+applied together. Group ids are any non-empty strings, unique per gene.
+Every gene with variants also gets the haplotype without variants (the
+reference sequence), with group id REFERENCE, which the TSV may not use.
 Variants are SNVs, MNVs, insertions, deletions or complex changes, written
 as in VCF (e.g. insertion A -> ATG, deletion ACGT -> A); see sequence.py for
 how they are applied. Variants of one haplotype may not overlap.
@@ -16,6 +17,7 @@ import csv
 from dataclasses import dataclass
 
 BASES = "ACGT"
+REFERENCE = "reference"  # group id of each gene's reference haplotype
 
 
 class InputError(ValueError):
@@ -47,7 +49,7 @@ class Variant:
 @dataclass(frozen=True)
 class Haplotype:
     gene: str
-    group: int
+    group: str
     variants: tuple  # Variants, sorted by position
 
 
@@ -102,8 +104,8 @@ def read_regions(path):
 
 
 def read_haplotypes(path, genes):
-    """{gene name: [Haplotype, ...] ordered by group}, for genes with
-    variants."""
+    """{gene name: [reference Haplotype, Haplotype, ...]}, for genes with
+    variants; groups in order of first appearance."""
     groups = {}  # gene -> group -> pos -> Variant
     for line, row in _rows(path, ("chrom", "pos", "ref", "alt", "group", "gene")):
         where = f"{path}:{line}"
@@ -125,12 +127,15 @@ def read_haplotypes(path, genes):
                              f"the preceding base")
         if ref == alt:
             raise InputError(f"{where}: ALT equals REF")
-        group = _int(row["group"], path, line, "group")
-        if group < 0:
-            raise InputError(f"{where}: group must be >= 0")
+        group = row["group"]
+        if not group:
+            raise InputError(f"{where}: empty group")
+        if group == REFERENCE:
+            raise InputError(f"{where}: group {REFERENCE!r} is reserved for "
+                             f"the reference sequence, which always runs")
         by_pos = groups.setdefault(gene.name, {}).setdefault(group, {})
         if pos in by_pos:
-            raise InputError(f"{where}: group {group} of gene {gene.name} "
+            raise InputError(f"{where}: group {group!r} of gene {gene.name} "
                              f"already has a variant at {gene.chrom}:{pos} "
                              f"(line {by_pos[pos].line})")
         by_pos[pos] = Variant(gene.chrom, pos, ref, alt, line)
@@ -139,25 +144,14 @@ def read_haplotypes(path, genes):
     for name in genes:
         if name not in groups:
             continue
-        by_group = groups[name]
-        if min(by_group) == 1:
-            by_group[0] = {}  # the reference sequence
-        ids = sorted(by_group)
-        if ids != list(range(len(ids))):
-            missing = sorted(set(range(ids[-1] + 1)) - set(ids))
-            raise InputError(
-                f"{path}: gene {name}: group ids must run 0, 1, 2, ... "
-                f"(or start at 1, making group 0 the reference); missing "
-                f"{', '.join(map(str, missing))}"
-            )
-        haplotypes[name] = []
-        for g in ids:
-            variants = tuple(v for _, v in sorted(by_group[g].items()))
+        haplotypes[name] = [Haplotype(name, REFERENCE, ())]
+        for g, by_pos in groups[name].items():
+            variants = tuple(v for _, v in sorted(by_pos.items()))
             for a, b in zip(variants, variants[1:]):
                 if a.pos + len(a.ref) > b.pos:
                     raise InputError(
                         f"{path}:{b.line}: overlaps the variant on line "
-                        f"{a.line} (group {g} of gene {name})"
+                        f"{a.line} (group {g!r} of gene {name})"
                     )
             haplotypes[name].append(Haplotype(name, g, variants))
     return haplotypes
