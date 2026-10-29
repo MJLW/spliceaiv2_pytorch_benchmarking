@@ -15,6 +15,11 @@ ASSEMBLY_CHANNELS = {
     "GRCm38": 12,
     "GRCr8": 13,
 }
+HUMAN = "GRCh38"
+
+# Base codes used for haplotype sequences: 0-3 = A, C, G, T; N_CODE for any
+# other character; PAD_CODE for positions past a chromosome end.
+N_CODE, PAD_CODE = 4, 5
 
 # Like the reference, any other character (N, lowercase, ...) maps to channel 0.
 _LUT = np.zeros(256, dtype=np.intp)
@@ -22,7 +27,7 @@ for _nuc, _channel in NUCLEOTIDE_CHANNELS.items():
     _LUT[ord(_nuc)] = _channel
 
 
-def one_hot_encode(seq, assembly="GRCh38", length=None):
+def one_hot_encode(seq, assembly=HUMAN, length=None):
     """Returns a (14, length) uint8 array (length defaults to len(seq)).
 
     Positions past the end of ``seq`` are padding: all nucleotide channels
@@ -33,6 +38,21 @@ def one_hot_encode(seq, assembly="GRCh38", length=None):
     x = np.zeros((NUM_CHANNELS, length), dtype=np.uint8)
     x[codes, np.arange(len(seq))] = 1
     x[ASSEMBLY_CHANNELS.get(assembly, 4)] = 1
+    return x
+
+
+def one_hot_codes(codes):
+    """(14, n) uint8 one-hot of base codes, human assembly channel.
+
+    N_CODE is encoded like ``one_hot_encode`` encodes N (channel 0);
+    PAD_CODE like its padding (no nucleotide channel).
+    """
+    codes = np.asarray(codes)
+    x = np.zeros((NUM_CHANNELS, len(codes)), dtype=np.uint8)
+    nuc = np.nonzero(codes < 4)[0]
+    x[codes[nuc], nuc] = 1
+    x[0, codes == N_CODE] = 1
+    x[ASSEMBLY_CHANNELS[HUMAN]] = 1
     return x
 
 

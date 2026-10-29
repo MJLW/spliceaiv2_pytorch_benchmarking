@@ -155,9 +155,10 @@ def markdown(results, args, env_info):
         s = res["summary"]
         clk = s["telemetry"]["sm_clock_mhz"]
         clk = f"{clk[0]:.0f}–{clk[1]:.0f}" if clk else "n/a"
-        rows = [("fixed", "Fixed 100k")]
+        rows = [("fixed", f"Fixed {args.seq_len:,}")]
         if not variable_done:
-            rows.append(("variable", f"Variable N(100k, {args.var_std:,.0f})"))
+            rows.append(("variable", f"Variable N({args.seq_len:,}, "
+                                     f"{args.var_std:,.0f})"))
             variable_done = True
         for key, label in rows:
             w = s[key]

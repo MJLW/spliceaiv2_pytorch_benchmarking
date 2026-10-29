@@ -1,15 +1,25 @@
-# spliceai2-bench
+# spliceai2-ism
 
-GPU runtime benchmark for [SpliceAI2](https://github.com/Illumina/SpliceAI2)
-inference. By default it scores 100 sequences of 100,000 positions each with
-the two-model ensemble, using FP16 autocast and `torch.compile` (cuDNN
-convolutions).
+In-silico saturation mutagenesis (ISM) of gene haplotypes with
+[SpliceAI2](https://github.com/Illumina/SpliceAI2). For every haplotype of a
+gene (any combination of SNVs, MNVs and indels), it predicts the haplotype
+sequence, then scores every possible SNV in the haplotype's gene body
+against it (three per base) and reports how each SNV changes the
+splice-site and junction probabilities.
 
-The model code here is an independent inference-only PyTorch implementation
+SNVs are scored incrementally: one full pass of the haplotype keeps every
+block's activations, and each SNV then recomputes only the part of the
+network it can change, a cone of ±56,480 nt for the released models (see
+[How it works](#how-it-works)). Results equal full forward passes up to
+FP16 rounding.
+
+The model code is an independent inference-only PyTorch implementation
 written from the reference repository. It keeps the reference module names so
 the released checkpoints load with `strict=True`. Weights come from the gated
 Hugging Face repo [`illumina-ai/SpliceAI2`](https://huggingface.co/illumina-ai/SpliceAI2),
-under the SpliceAI2 Model Terms of Use (non-commercial).
+under the SpliceAI2 Model Terms of Use (non-commercial). Both models of the
+released ensemble are used, with FP16 autocast and `torch.compile`, as in the
+reference scorer.
 
 ## Setup
 
@@ -18,168 +28,219 @@ uv sync
 uv run hf auth login   # once; accept the model terms on Hugging Face first
 ```
 
+The weights are downloaded into the Hugging Face cache on first use.
 `torch.compile` needs a C compiler and a writable `$HOME`.
 
 ## Usage
 
 ```bash
-uv run spliceai2-bench                                   # 100 × 100,000, 1D + 2D
-uv run spliceai2-bench --no-compile                      # eager baseline
-uv run spliceai2-bench --batch-size 4 --cudnn-benchmark  # tuning knobs
-uv run spliceai2-bench --heads 1d --json-out results.json
+uv run spliceai2-ism --variants haplotypes.tsv --regions genes.tsv \
+    --fasta GRCh38.fa --out-dir results/ism-run1
+sbatch scripts/ism.sbatch --variants ... --regions ... --fasta ... --out-dir ...
 ```
 
-If `--model-dir` is omitted, both model folders
-(`spliceai2_multispecies_13M_01`, `_02`) are downloaded into the HF cache.
+| Option | Default | |
+|---|---|---|
+| `--genes` | all in the variant TSV | optional comma-separated subset, e.g. to split a run over a SLURM job array |
+| `--variant-batch-size` | `auto` | SNVs per incremental batch; `auto` picks the largest that fits in GPU memory (see below) |
+| `--out-2d-len` | 1024 | candidate sites for the junction head (reference default) |
+| `--min-delta` | 1e-3 | smallest \|Δ probability\| written to `deltas.parquet` |
+| `--length-bucket` | 16,384 | gene lengths are rounded up to a multiple of this, so genes share compiled graphs |
+| `--debug` | off | run eagerly, without `torch.compile` |
 
-## What is measured
+### Batch size
 
-Every run times two workloads in the same process:
+With `--variant-batch-size auto`:
 
-- **fixed:** `--n-seqs` sequences of exactly `--seq-len` output positions,
-  with batch size `--batch-size`.
-- **variable:** `--n-seqs` sequences whose output lengths are drawn from
-  N(`--var-mean`, `--var-std`), by default N(100,000, 10,000) with seed
-  `--seed + 1`. Lengths are rounded so the model accepts them. These run at
-  batch size 1. The report adds a linear fit of per-sequence GPU time
-  against real input length.
+- **Measurement:** before the run, SNV batches of 1 and 5 are scored eagerly
+  on the longest gene, and their peak GPU memory gives a fixed part plus a
+  cost per SNV. This takes seconds and needs no compilation.
+- **Choice:** the largest batch whose estimated peak fits in 80% of the
+  memory available to the process. It is rounded down to a multiple of 8 and
+  capped at 256, beyond which throughput no longer improves. The choice and
+  the measurements are printed and stored in `run.json`.
+- **Fallback:** if a batch still runs out of memory, the batch size is
+  halved for that batch and all later ones. Halving recompiles the SNV stage
+  once. This also applies to a fixed `--variant-batch-size`.
 
-How the variable workload is compiled (`--var-mode`):
+### Inputs
 
-- `bucket` (default): each sequence is padded up to a multiple of
-  `--bucket-size` output positions (default 8,192), and each bucket size
-  gets its own static graph.
-  - Padding goes after the right-hand flank. It is all-zero nucleotide
-    channels, and it doesn't change the outputs at real positions.
-  - The 2D stage ignores padded positions when choosing candidate sites,
-    and padded outputs are dropped before the copy back to the CPU.
-  - The report shows the padding overhead and the time per bucket.
-- `dynamic`: one graph with a dynamic length dimension serves every length,
-  with no padding. In testing it was about 24% slower than a static graph on
-  identical inputs.
+**Regions** (`--regions`), one row per gene; coordinates 1-based, inclusive:
 
-Each workload has its own compile cache, so the fixed workload always keeps
-its own static graph.
-
-Measurements are interleaved so that GPU heating cannot favour one workload:
-
-- Within each pass, the two workloads' batches alternate, spread evenly
-  across the pass.
-- Each round reverses the batch order of the one before (A-B-B-A); the
-  default `--repeats 4` balances it.
-- GPU-timed and end-to-end passes swap order every round.
-
-Each pass logs GPU temperature, SM clock and power at its start and end
-(through NVML).
-
-Before timing, every variable length runs once untimed. This triggers any
-remaining compilation, and an out-of-memory error stops the run at that
-point rather than during timing. During timing, a recompile raises an error
-instead of silently skewing the numbers.
-
-- **Input:** each sequence is `length + crop_len` nt (crop_len = flanking
-  context, read from the checkpoint; 131,072 for the released models). The
-  model predicts the central `length` positions in one forward pass, the
-  same as the reference. No tiling is involved. `length + crop_len` must be
-  divisible by the deepest pooling factor.
-- **1D stage:** trunk plus splice-site heads for both models, logits averaged.
-- **2D stage:** top-`out_2d_len` candidate sites (default 1024, as in the
-  reference scorer), then the junction heads for both models, averaged. Its
-  cost is O(out_2d_len²) and does not depend on sequence length.
-- **First call:** wall-clock time for the first batch of each distinct batch
-  shape, which includes `torch.compile` and cuDNN setup. Reported separately.
-- **Steady-state GPU time:** CUDA events around each stage, summed over all
-  sequences. Each batch is copied to the GPU before its start event, so the
-  copy is not timed. Median, min and max over rounds.
-- **End-to-end:** wall clock from Python strings to CPU probabilities. Covers
-  one-hot encoding, pinned H2D copy, both stages and D2H copy.
-- **Peak GPU memory:** the largest single batch in each workload.
-
-Sequences are random ACGT with the GRCh38 species channel; runtime does not
-depend on sequence content.
-
-## Single-base substitutions
-
-```bash
-uv run spliceai2-mutbench                       # reference + 99 substitutions
-uv run spliceai2-mutbench --variant-batch-size 33 --json-out mut.json
+```
+NAME	CHROM	STRAND	TX_START	TX_END
+BRCA1	chr17	-	43044295	43125483
 ```
 
-`spliceai2_bench.incremental.IncrementalEnsemble` scores single-base
-substitutions against a cached reference.
+**Variants** (`--variants`), one row per variant of a haplotype; `POS`
+1-based, REF and ALT as in VCF:
 
-- **How it works:** a substitution can only change activations inside a cone
+```
+CHROM	POS	REF	ALT	group	gene
+chr17	43045000	A	G	1	BRCA1
+chr17	43071077	T	TGA	1	BRCA1
+chr17	43045000	A	G	2	BRCA1
+chr17	43090010	CAGT	C	2	BRCA1
+```
+
+- A haplotype is a `(gene, group)` pair: all of that group's variants in
+  that gene, applied together.
+- `gene` must match a `NAME` in the region file.
+- Group ids per gene run 0, 1, 2, ... If they start at 1, group 0 is the
+  haplotype without variants (the reference sequence). Other gaps are an
+  error.
+- The genes that run are the ones in this file's `gene` column. The region
+  file is only looked up for their coordinates, so it can be a full
+  annotation; genes without variants are not run.
+- Variants can be SNVs, MNVs, insertions, deletions or complex changes:
+  REF and ALT are any non-empty sequences of A, C, G, T, with indels
+  written as in VCF, including the preceding base (insertion `T` → `TGA`,
+  deletion `CAGT` → `C`). Symbolic alleles (`<DEL>`, `*`, `-`) are not
+  accepted.
+- How a variant is applied: ALT's bases pair with REF's from the left and
+  replace them. Extra ALT bases are inserted after the last REF base, and
+  extra REF bases are deleted.
+- REF must match the FASTA over its whole length. Variants of one haplotype
+  may not overlap, e.g. an SNV inside a deletion.
+- Variants in the flanking context count too. Variants too far from the
+  gene to affect it are ignored with a warning.
+- Header names are case-insensitive and may start with `#`.
+
+**FASTA** (`--fasta`): the GRCh38 reference, read with pyfaidx (it writes a
+`.fai` index next to the FASTA if there is none). The model always gets the
+human (GRCh38) species channel.
+
+### Outputs
+
+Four Parquet tables, plus `run.json`. All values are probabilities
+(sigmoid of the model's logits).
+
+**Coordinates.** Every base of a haplotype has two positions, both 1-based
+and forward strand:
+
+- `haplotype_pos`: its position on the haplotype's own chromosome, the
+  reference chromosome with all of the haplotype's variants applied. It
+  equals the reference position up to the first indel, and is shifted by
+  every indel before it.
+- `reference_pos`: its GRCh38 position; null for bases the haplotype
+  inserts. Bases the haplotype deletes are absent: no predictions, no SNVs.
+
+For `1000 A → ATG` with no indels before it, the bases are A `(1000, 1000)`,
+T `(null, 1001)`, G `(null, 1002)`, and the next reference base
+`(1001, 1003)` as `(reference_pos, haplotype_pos)`. Haplotypes line up on
+`reference_pos`. A haplotype's gene body is its bases at
+`TX_START`–`TX_END`, plus bases inserted after `TX_START`–`TX_END − 1`; an
+insertion right after `TX_END` is flank.
+
+**`predictions_sites.parquet`**: one row per gene-body base of each
+haplotype.
+
+| Column | |
+|---|---|
+| `gene`, `group` | the haplotype |
+| `reference_pos`, `haplotype_pos` | the base |
+| `donor_prob`, `acceptor_prob` | splice-site probabilities |
+
+**`predictions_junctions.parquet`**: one row per donor-acceptor pair of the
+haplotype's top-`--out-2d-len` candidate sites that lies inside the gene
+(about 524k pairs at 1024).
+
+| Column | |
+|---|---|
+| `gene`, `group` | the haplotype |
+| `donor_reference_pos`, `donor_haplotype_pos` | the donor |
+| `acceptor_reference_pos`, `acceptor_haplotype_pos` | the acceptor |
+| `prob` | junction probability |
+
+**`deltas_sites.parquet`** and **`deltas_junctions.parquet`**: per haplotype
+and SNV, the signed change against the haplotype,
+`delta = P(SNV) − P(haplotype)`. They have the same columns as the
+prediction tables, with deltas instead of probabilities (`donor_delta`,
+`acceptor_delta`; `delta`), plus the SNV:
+
+| Column | |
+|---|---|
+| `snv_reference_pos`, `snv_haplotype_pos` | the SNV's base |
+| `snv_ref`, `snv_alt` | `snv_ref` is the haplotype's base (at a haplotype variant that is its ALT, so one SNV reverts to REF) |
+
+A site row is written when its donor or acceptor delta reaches
+`--min-delta`; a junction row when its delta does. An SNV with no change
+above the threshold has no rows. Every base of the haplotype's gene body
+that is A, C, G or T is saturated, inserted bases included, with all three
+other bases. Junctions are keyed by their donor and acceptor positions. An
+SNV can change the top-k candidate sites, so a pair predicted for only one
+of SNV and haplotype counts as probability 0 for the other.
+
+**`run.json`**: configuration, environment and per-haplotype timings.
+
+Example, with DuckDB:
+
+```sql
+SELECT snv_reference_pos, snv_alt, reference_pos, donor_delta, acceptor_delta
+FROM 'results/ism-run1/deltas_sites.parquet'
+WHERE gene = 'BRCA1' AND "group" = 1
+ORDER BY greatest(abs(donor_delta), abs(acceptor_delta)) DESC LIMIT 20;
+```
+
+### Strand
+
+Minus-strand genes are reverse-complemented for prediction, as SpliceAI-style
+models score the transcribed strand. Outputs are mapped back to the forward
+strand: both positions are forward strand, and `snv_ref` / `snv_alt` are
+forward-strand bases. Donor and acceptor keep their biological meaning, so
+on the minus strand a junction's donor lies at a higher coordinate than its
+acceptor.
+
+### Limits
+
+- One forward pass per gene, no tiling: the gene plus 131,072 nt of context
+  must fit in GPU memory (about 3 GiB at 150k nt input, growing roughly
+  linearly).
+- Genes shorter than `--out-2d-len` nt are scored too. Their candidate
+  sites are chosen among the first `--out-2d-len` positions from the gene
+  start (in transcript orientation), so they include sequence past the
+  gene's 3' end. Only junctions with both sites in the gene are reported.
+- A 100 kb gene has about 300,000 SNVs per haplotype. Throughput is logged
+  per haplotype (SNVs/s); the first haplotype of each length bucket also
+  pays for `torch.compile`.
+
+## How it works
+
+`spliceai2_ism.incremental.IncrementalEnsemble`:
+
+- **The cone:** a substitution can only change activations inside a window
   that widens block by block. For the released models that is ±56,480 nt
   after the last block, within the 65,536 nt flank.
-  - One full pass of the reference keeps every block's pooled output.
-  - Each variant then recomputes only its cone (about 1.8% of a full pass's
-    block positions at 100k).
-  - Everything outside the cone comes from the cache.
-- **What it returns:** the full 1D track and the 2D head with each variant's
-  own top-k sites. Both equal a full forward pass on the variant sequence, up
-  to floating-point rounding.
-- **Two rewrites, both exact in exact arithmetic:**
-  - Splice-site heads are applied before the linear upsampling.
+  - One full pass of the haplotype keeps every block's pooled output.
+  - Each SNV then recomputes only the block outputs inside its cone (about
+    1.3% of a full pass at 100k), reading the context around them from the
+    cache.
+- **Three rewrites, all exact in exact arithmetic:**
+  - Splice-site heads are applied before the linear upsampling, and an SNV's
+    track is only stitched together inside its cone.
   - Junction-head features are interpolated straight from the pooled block
     outputs.
-- **Cache size:** under 1 GiB per model at 100k positions. In a 16k run,
-  peak memory was 2.6 GiB with the reference cache and a full pass's cache
-  both resident.
-
-The benchmark runs two workloads, interleaved as above:
-
-- **full:** a complete forward pass for the reference and for each variant
-  sequence, batch 1.
-- **incremental:** one reference pass, then the variants in batches of
-  `--variant-batch-size`.
-
-Both workloads use the same code paths, so the comparison isolates the
-recomputation that is saved. Before timing, it checks:
-
-- each variant's incremental prediction against its full pass;
-- both paths against the original `Ensemble` code, on a short sequence in
-  eager mode.
-
-## Full suite (one command)
-
-```bash
-uv run spliceai2-suite                     # on a GPU machine
-sbatch scripts/h100_suite.sbatch           # on a SLURM cluster; adjust #SBATCH lines
-```
-
-By default every benchmark makes 500 predictions of 100,000 positions:
-
-| Benchmark | Command used | Workload |
-|---|---|---|
-| fixed | `spliceai2-bench` | 500 sequences × 100k; once per `--fixed-batch-sizes` entry (default 1 and 8) |
-| variable | `spliceai2-bench` | 500 sequences, lengths ~ N(100k, 10k), bucketed |
-| random substitutions | `spliceai2-mutbench --layout random` | reference + 499 substitutions at random positions |
-| consecutive substitutions | `spliceai2-mutbench --layout consecutive` | reference + 499 substitutions at adjacent positions |
-
-- **Defaults for an H100:** the incremental workloads run variants in
-  batches of `--variant-batch-size` (default 100).
-- **Isolation:** each benchmark runs in its own process.
-- **Output:** each benchmark's JSON and log, plus `summary.md` and
-  `summary.json`, go to `results/suite-<timestamp>/` (or `--out-dir`).
-- **Failures:** if one benchmark fails, it is marked in the summary and the
-  suite carries on with the next.
-- **Time on an H100:** I estimate about an hour. About a third of that is
-  the first-time `torch.compile` of each graph, which the on-disk compile
-  cache speeds up on later runs.
-
-If the cluster's compute nodes have no internet, download the weights on a
-login node first:
-
-```bash
-uv run hf auth login
-uv run python -c "from spliceai2_bench.weights import download_models; print(download_models())"
-```
-
-Then either pass the printed folder as `--model-dir`, or share `HF_HOME`
-with the compute nodes.
+  - Each block's input window carries one token-mixer radius of context per
+    side; only the outputs that can change are computed from it, so the FFN
+    never runs on that context.
+- **Top-k per SNV:** the junction head picks each SNV's own top-k sites from
+  its full splice-site track, as a full pass would.
 
 ## Tests
 
 ```bash
-uv run pytest
+uv run pytest           # CPU, small random models
+uv run pytest -m gpu    # released models on the GPU vs full forward passes
 ```
+
+The CPU tests run the whole pipeline on a synthetic chromosome, with one gene
+per strand, and check every reported probability against independent full
+forward passes. The GPU test does the same with the released weights,
+compiled and in debug mode, with a tolerance of 5e-4 for FP16 rounding. It
+needs the Hugging Face login and takes several minutes, mostly compilation.
+
+## Benchmarks
+
+The runtime benchmarks this project started from are in
+[`benchmarks/`](benchmarks/README.md) (`spliceai2-bench`,
+`spliceai2-mutbench`, `spliceai2-suite`).

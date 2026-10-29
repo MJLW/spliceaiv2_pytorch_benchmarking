@@ -1,7 +1,7 @@
 import numpy as np
 
-from spliceai2_bench.encode import random_sequences, random_sequences_of_lengths
 from spliceai2_bench.workloads import bucket_lengths, interleave, normal_lengths
+from spliceai2_ism.encode import random_sequences, random_sequences_of_lengths
 
 CROP_LEN, MULTIPLE = 131_072, 16
 

@@ -1,9 +1,9 @@
 import torch
 
-from spliceai2_bench.encode import one_hot_encode, random_sequences
-from spliceai2_bench.model import SpliceAI2
-from spliceai2_bench.predict import Ensemble
-from spliceai2_bench.weights import load_model
+from spliceai2_ism.encode import one_hot_encode, random_sequences
+from spliceai2_ism.model import SpliceAI2
+from spliceai2_ism.predict import Ensemble, predict_full
+from spliceai2_ism.weights import load_model
 
 NUM_FEATURES, NUM_BLOCKS, CROP_LEN, OUT_LEN = 8, 8, 64, 96
 
@@ -65,6 +65,19 @@ def test_ensemble_averages_models():
     assert idxs.shape == (2, 16)
     assert (idxs.diff(dim=1) > 0).all()
     assert out_jxn.shape == (2, 16, 16)
+
+
+def test_predict_full_matches_ensemble():
+    models = [small_model(0), small_model(1)]
+    ens = Ensemble(models, out_2d_len=16).eval()
+    x = batch()
+    valid_len = torch.tensor([40, 96])
+    with torch.inference_mode():
+        ftrs, out_ss = ens.trunk_1d(x)
+        idxs, out_jxn = ens.head_2d(ftrs, out_ss, valid_len)
+        full = predict_full(models, x, 16, valid_len)
+    for a, b in zip(full, (out_ss, idxs, out_jxn)):
+        torch.testing.assert_close(a, b)
 
 
 def test_head_2d_ignores_padding():

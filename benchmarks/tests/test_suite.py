@@ -1,10 +1,10 @@
-from spliceai2_bench.encode import random_sequences
 from spliceai2_bench.mutation_benchmark import (
     BASES,
     apply_substitution,
     random_substitutions,
 )
 from spliceai2_bench.suite import benchmarks, markdown, parse_args, summarize
+from spliceai2_ism.encode import random_sequences
 
 CROP = 64
 

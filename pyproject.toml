@@ -1,17 +1,20 @@
 [project]
-name = "spliceai2-bench"
-version = "0.1.0"
-description = "GPU runtime benchmark for SpliceAI2 inference (FP16 autocast + torch.compile)"
+name = "spliceai2-ism"
+version = "0.2.0"
+description = "SNV saturation mutagenesis of gene haplotypes with SpliceAI2 (incremental inference, FP16 + torch.compile)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.1",
     "numpy>=1.21",
     "huggingface_hub>=0.20",
-    "nvidia-ml-py>=12",  # GPU temperature / clock / power logging
+    "pyfaidx>=0.8",
+    "pyarrow>=14",
+    "nvidia-ml-py>=12",  # GPU temperature / clock / power logging (benchmarks)
 ]
 
 [project.scripts]
+spliceai2-ism = "spliceai2_ism.ism:main"
 spliceai2-bench = "spliceai2_bench.benchmark:main"
 spliceai2-mutbench = "spliceai2_bench.mutation_benchmark:main"
 spliceai2-suite = "spliceai2_bench.suite:main"
@@ -22,3 +25,11 @@ dev = ["pytest>=8"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/spliceai2_ism", "benchmarks/spliceai2_bench"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "benchmarks/tests"]
+markers = ["gpu: needs a CUDA GPU and access to the released weights"]
+addopts = "-m 'not gpu'"

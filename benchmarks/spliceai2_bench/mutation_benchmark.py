@@ -6,7 +6,7 @@ torch.compile. They are produced two ways in the same process:
   * full:        a complete forward pass per sequence, batch 1;
   * incremental: one pass of the reference that keeps per-block activations,
                  then batches of variants that recompute only what each
-                 substitution can change (see incremental.py).
+                 substitution can change (see spliceai2_ism.incremental).
 Both use IncrementalEnsemble's code, so the comparison isolates the
 recomputation saved. Before timing, each variant's incremental prediction is
 compared with its full pass, and both paths are checked against the original
@@ -30,16 +30,13 @@ import numpy as np
 import torch
 import torch._dynamo
 
-from spliceai2_bench.benchmark import (
-    environment_info,
-    fmt_telemetry,
-    gpu_telemetry,
-    summarize,
-)
-from spliceai2_bench.encode import one_hot_encode, random_sequences
-from spliceai2_bench.incremental import IncrementalEnsemble
-from spliceai2_bench.weights import checkpoint_paths, download_models, load_model
+from spliceai2_bench.benchmark import fmt_telemetry, gpu_telemetry, summarize
 from spliceai2_bench.workloads import interleave
+from spliceai2_ism.encode import one_hot_encode, random_sequences
+from spliceai2_ism.incremental import IncrementalEnsemble
+from spliceai2_ism.predict import predict_full
+from spliceai2_ism.runtime import environment_info, forbid_eager_fallback
+from spliceai2_ism.weights import checkpoint_paths, download_models, load_model
 
 BASES = "ACGT"
 WORKLOADS = ("full", "incremental")
@@ -125,7 +122,9 @@ class Stages:
     def __init__(self, inc, compile_):
         self.ref_1d = lambda x: inc.reference_1d(x)
         self.ref_2d = lambda z, out_ss: inc.head_2d(z, out_ss)
-        self.var_1d = lambda cache, pos, alt: inc.variants_1d(cache, pos, alt)
+        self.var_1d = lambda cache, ref_ss, pos, alt: inc.variants_track(
+            cache, ref_ss, pos, alt
+        )
         self.var_2d = lambda z, out_ss, pos, z_var: inc.head_2d(
             z, out_ss, pos, z_var
         )
@@ -185,7 +184,7 @@ class IncrementalWorkload:
             )
         self.pinned = [tuple(torch.tensor(v).pin_memory() for v in b[:2])
                        for b in self.batches]
-        self.cache = None
+        self.cache = self.ref_ss = None
         self.peak_mem = 0
 
     def __len__(self):
@@ -209,14 +208,17 @@ class IncrementalWorkload:
     def run(self, inp, between=None):
         with inference():
             if isinstance(inp, torch.Tensor):
-                self.cache = None  # free the old cache before building anew
-                self.cache, out_ss = self.stages.ref_1d(inp)
+                # free the old cache before building anew
+                self.cache = self.ref_ss = None
+                self.cache, self.ref_ss = self.stages.ref_1d(inp)
                 if between is not None:
                     between()
+                out_ss = self.ref_ss
                 idxs, out_jxn = self.stages.ref_2d(self.cache[1], out_ss)
             else:
                 pos, alt = inp
-                z_var, out_ss = self.stages.var_1d(self.cache, pos, alt)
+                z_var, out_ss = self.stages.var_1d(self.cache, self.ref_ss,
+                                                   pos, alt)
                 if between is not None:
                     between()
                 idxs, out_jxn = self.stages.var_2d(
@@ -309,17 +311,6 @@ def compare(ours, theirs):
     }
 
 
-def original_predict(models, x, out_2d_len):
-    """``Ensemble.trunk_1d`` + ``head_2d`` with the original model code, one
-    model's full-length features at a time: the 1D pass picks the top-k
-    sites, a second pass runs the junction heads on them."""
-    x = x.float()
-    out_ss = torch.stack([m.forward_1d(m(x)) for m in models]).mean(dim=0)
-    idxs = out_ss.amax(dim=1).topk(out_2d_len, dim=1)[1].sort(dim=1).values
-    out_jxn = torch.stack([m.forward_2d(m(x), idxs) for m in models]).mean(dim=0)
-    return out_ss, idxs, out_jxn
-
-
 def check_against_original(models, inc, args, device):
     """Eager reference pass and a few variants of a short sequence through
     IncrementalEnsemble, vs full passes of the original model code."""
@@ -333,7 +324,7 @@ def check_against_original(models, inc, args, device):
         cache, ref_ss = inc.reference_1d(encode(seq).to(device))
         idxs, jxn = inc.head_2d(cache[1], ref_ss)
         ours = [(ref_ss[0], idxs[0], jxn[0])]
-        z_var, var_ss = inc.variants_1d(cache, pos, alt)
+        z_var, var_ss = inc.variants_track(cache, ref_ss, pos, alt)
         idxs, jxn = inc.head_2d(cache[1], var_ss, pos, z_var)
         ours += [(var_ss[j], idxs[j], jxn[j]) for j in range(len(positions))]
         del cache, z_var
@@ -342,8 +333,8 @@ def check_against_original(models, inc, args, device):
         theirs = []
         for s in [seq] + [apply_substitution(seq, crop_len, p, a)
                           for p, a in zip(positions, alts)]:
-            ss, idx, jx = original_predict(models, encode(s).to(device),
-                                           args.out_2d_len)
+            ss, idx, jx = predict_full(models, encode(s).to(device),
+                                       args.out_2d_len)
             theirs.append((ss[0], idx[0], jx[0]))
     return {"reference": compare(ours[:1], theirs[:1]),
             "variants": compare(ours[1:], theirs[1:])}
@@ -419,10 +410,7 @@ def main(argv=None):
     workloads = [full, incr]
 
     if compile_:
-        # never fall back to eager silently if a stage keeps recompiling
-        for flag in ("fail_on_recompile_limit_hit", "fail_on_cache_limit_hit"):
-            if hasattr(torch._dynamo.config, flag):
-                setattr(torch._dynamo.config, flag, True)
+        forbid_eager_fallback()
 
     print("Compiling / warming up...", flush=True)
     warmup_s = {"reference pass": warmup(full, 0)}
@@ -582,7 +570,7 @@ def print_report(r):
     print(f"  incremental        variant batch {c['variant_batch_size']}; a "
           f"substitution reaches ±{g['reach_nt']:,} nt; "
           f"{100 * g['recompute_fraction']:.2f}% of a full pass's block "
-          f"positions recomputed per variant")
+          f"outputs recomputed per variant")
     print(f"  timing             {c['repeats']} interleaved rounds (ABBA), "
           f"median [min–max]")
     print()

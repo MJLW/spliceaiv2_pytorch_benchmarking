@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from spliceai2_bench.model import SpliceAI2
+from spliceai2_ism.model import SpliceAI2
 
 REPO_ID = "illumina-ai/SpliceAI2"
 MODEL_FOLDERS = (
@@ -56,3 +56,8 @@ def load_model(ckpt_path):
     model = SpliceAI2(**hparams)
     model.load_state_dict(ckpt["state_dict"], strict=True)
     return model.eval()
+
+
+def load_released_models():
+    """Both released models, downloaded into (or read from) the HF cache."""
+    return [load_model(p) for p in checkpoint_paths(download_models())]

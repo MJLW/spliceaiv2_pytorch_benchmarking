@@ -30,14 +30,19 @@ import numpy as np
 import torch
 import torch._dynamo
 
-from spliceai2_bench.encode import (
+from spliceai2_bench.workloads import bucket_lengths, interleave, normal_lengths
+from spliceai2_ism.encode import (
     one_hot_encode,
     random_sequences,
     random_sequences_of_lengths,
 )
-from spliceai2_bench.predict import Ensemble
-from spliceai2_bench.weights import checkpoint_paths, download_models, load_model
-from spliceai2_bench.workloads import bucket_lengths, interleave, normal_lengths
+from spliceai2_ism.predict import Ensemble
+from spliceai2_ism.runtime import (
+    environment_info,
+    forbid_eager_fallback,
+    raise_recompile_limit,
+)
+from spliceai2_ism.weights import checkpoint_paths, download_models, load_model
 
 WORKLOADS = ("fixed", "variable")
 
@@ -343,15 +348,6 @@ def summarize_workload(w, gpu_rounds, e2e_rounds, crop_len, do_2d):
     return out
 
 
-def environment_info():
-    return {
-        "gpu": torch.cuda.get_device_name(),
-        "torch": torch.__version__,
-        "cuda": torch.version.cuda,
-        "cudnn": torch.backends.cudnn.version(),
-    }
-
-
 def fmt_telemetry(before, after):
     def pair(key, unit, spec):
         a, b = before[key], after[key]
@@ -362,14 +358,6 @@ def fmt_telemetry(before, after):
     parts = [pair("temp_c", "°C", ".0f"), pair("sm_clock_mhz", "MHz", ".0f"),
              pair("power_w", "W", ".0f")]
     return ", ".join(p for p in parts if p) or "telemetry unavailable"
-
-
-def raise_recompile_limit(n_graphs):
-    cfg = torch._dynamo.config
-    for name in ("recompile_limit", "cache_size_limit"):
-        if hasattr(cfg, name):
-            setattr(cfg, name, max(getattr(cfg, name), n_graphs + 2))
-            return
 
 
 def main(argv=None):
@@ -433,10 +421,7 @@ def main(argv=None):
     if compile_:
         if bucketed:
             raise_recompile_limit(len(set(variable.in_lens)))
-        # never fall back to eager silently if a workload keeps recompiling
-        for flag in ("fail_on_recompile_limit_hit", "fail_on_cache_limit_hit"):
-            if hasattr(torch._dynamo.config, flag):
-                setattr(torch._dynamo.config, flag, True)
+        forbid_eager_fallback()
 
     print("Compiling / warming up...", flush=True)
     warmup_s = {"fixed": {}, "variable": {}}

@@ -42,3 +42,19 @@ class Ensemble(nn.Module):
             [model.forward_2d(f, idxs) for model, f in zip(self.models, ftrs)]
         ).mean(dim=0)
         return idxs, out_jxn
+
+
+def predict_full(models, x, out_2d_len, valid_len=None):
+    """``Ensemble.trunk_1d`` + ``head_2d`` with the original model code, one
+    model's full-length features at a time: the 1D pass picks the top-k
+    sites, a second pass runs the junction heads on them. Used to check the
+    incremental path against plain full forward passes."""
+    x = x.float()
+    out_ss = torch.stack([m.forward_1d(m(x)) for m in models]).mean(dim=0)
+    scores = out_ss.amax(dim=1)
+    if valid_len is not None:
+        pos = torch.arange(scores.shape[1], device=scores.device)
+        scores = scores.masked_fill(pos >= valid_len.unsqueeze(1), float("-inf"))
+    idxs = scores.topk(out_2d_len, dim=1)[1].sort(dim=1).values
+    out_jxn = torch.stack([m.forward_2d(m(x), idxs) for m in models]).mean(dim=0)
+    return out_ss, idxs, out_jxn

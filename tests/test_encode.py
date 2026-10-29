@@ -1,6 +1,12 @@
 import numpy as np
 
-from spliceai2_bench.encode import one_hot_encode, random_sequences
+from spliceai2_ism.encode import (
+    N_CODE,
+    PAD_CODE,
+    one_hot_codes,
+    one_hot_encode,
+    random_sequences,
+)
 
 
 def test_one_hot_layout():
@@ -32,6 +38,13 @@ def test_padding():
     np.testing.assert_array_equal(x[:, :3], one_hot_encode("ACG", "GRCh38"))
     np.testing.assert_array_equal(x[:4, 3:], 0)  # padding: no nucleotide
     np.testing.assert_array_equal(x[4], 1)
+
+
+def test_one_hot_codes_matches_string_encoder():
+    codes = np.array([0, 1, 2, 3, N_CODE, PAD_CODE, PAD_CODE], dtype=np.uint8)
+    np.testing.assert_array_equal(
+        one_hot_codes(codes), one_hot_encode("ACGTN", length=7)
+    )
 
 
 def test_random_sequences_deterministic():
