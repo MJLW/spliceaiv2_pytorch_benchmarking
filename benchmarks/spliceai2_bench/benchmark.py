@@ -30,6 +30,7 @@ import numpy as np
 import torch
 import torch._dynamo
 
+from spliceai2_bench.profiling import label, profile_workload
 from spliceai2_bench.workloads import bucket_lengths, interleave, normal_lengths
 from spliceai2_ism.encode import (
     one_hot_encode,
@@ -88,6 +89,14 @@ def parse_args(argv=None):
     )
     p.add_argument("--repeats", type=int, default=4,
                    help="rounds; an even number balances the ABBA order")
+    p.add_argument("--profile-dir", type=Path,
+                   help="write a torch.profiler trace of the fixed workload "
+                        "here, after timing")
+    p.add_argument("--profile-iters", type=int, default=3,
+                   help="profiled iterations")
+    p.add_argument("--profile-stacks", action="store_true",
+                   help="also record Python stacks and write GPU and CPU "
+                        "flamegraphs (SVG) next to the trace")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--json-out", type=Path)
     return p.parse_args(argv)
@@ -112,11 +121,13 @@ class Runner:
             torch._dynamo.maybe_mark_dynamic(x, 2)
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
             if not self.do_2d:
-                out_ss = self.stage_1d(x)
+                with label("1d"):
+                    out_ss = self.stage_1d(x)
                 if between is not None:
                     between()
                 return out_ss, None, None
-            ftrs, out_ss = self.stage_1d(x)
+            with label("1d"):
+                ftrs, out_ss = self.stage_1d(x)
             if between is not None:
                 between()
             if self.mark_dynamic:
@@ -124,7 +135,8 @@ class Runner:
                 for t in (*(f for model_ftrs in ftrs for f in model_ftrs),
                           out_ss):
                     torch._dynamo.maybe_mark_dynamic(t, 2)
-            idxs, out_jxn = self.stage_2d(ftrs, out_ss, valid_len)
+            with label("2d"):
+                idxs, out_jxn = self.stage_2d(ftrs, out_ss, valid_len)
             return out_ss, idxs, out_jxn
 
 
@@ -369,6 +381,8 @@ def main(argv=None):
     do_2d = args.heads == "1d,2d"
     compile_ = not args.no_compile
     bucketed = args.var_mode == "bucket"
+    if args.profile_stacks and not args.profile_dir:
+        sys.exit("--profile-stacks needs --profile-dir")
 
     t0 = time.perf_counter()
     model_dir = args.model_dir or download_models()
@@ -490,6 +504,26 @@ def main(argv=None):
                 flush=True,
             )
 
+    profile = None
+    if args.profile_dir:
+        print(f"Profiling the fixed workload ({args.profile_iters} "
+              f"iterations)...", flush=True)
+        items = range(min(3, len(fixed.batches)))
+
+        def step():
+            for i in items:
+                fixed.runner(fixed.batches[i].to(device, non_blocking=True),
+                             valid_len=fixed.valid(i, device))
+
+        n = sum(len(fixed._slice(fixed.seqs, i)) for i in items)
+        profile = {"fixed": {
+            "predictions_per_iter": n,
+            **profile_workload("fixed", step, args.profile_dir,
+                               args.profile_iters,
+                               stacks=args.profile_stacks,
+                               predictions_per_iter=n),
+        }}
+
     result = {
         "env": environment_info(),
         "config": {
@@ -520,6 +554,7 @@ def main(argv=None):
             )
             for w in workloads
         },
+        "profile": profile,
         "passes": passes,
     }
     print()
@@ -608,6 +643,21 @@ def print_report(r):
                       f"  {b['median_gpu_s_per_seq']:.4f} s")
         print(f"  Peak GPU memory                  "
               f"{w['peak_gpu_mem_bytes'] / 2**30:9.2f} GiB")
+
+    if r.get("profile"):
+        p = r["profile"]["fixed"]
+        print()
+        print(f"Profile, fixed workload (per iteration of "
+              f"{p['predictions_per_iter']} sequences)")
+        print(f"  GPU kernels {p['device_ms_per_iter']:.1f} ms, CPU ops "
+              f"{p['cpu_ms_per_iter']:.1f} ms, "
+              f"{p['kernel_launches_per_iter']:,.0f} kernel launches")
+        for k in p["top_kernels"][:5]:
+            print(f"    {100 * (k['share'] or 0):5.1f}%  "
+                  f"{k['device_ms_per_iter']:8.2f} ms  {k['name'][:70]}")
+        print(f"  trace {p['trace']}")
+        if "flamegraph_gpu" in p:
+            print(f"  flamegraphs {p['flamegraph_gpu']}, {p['flamegraph_cpu']}")
 
     print()
     print("Pass log")

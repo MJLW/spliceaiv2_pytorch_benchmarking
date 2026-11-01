@@ -11,7 +11,9 @@ uv run spliceai2-bench --batch-size 4 --cudnn-benchmark  # tuning knobs
 uv run spliceai2-bench --heads 1d --json-out results.json
 uv run spliceai2-mutbench                                # reference + 99 substitutions
 uv run spliceai2-suite                                   # all of the above
+uv run spliceai2-sweep                                   # batch-size sweep, naive vs incremental
 sbatch benchmarks/h100_suite.sbatch                      # on a SLURM cluster
+sbatch benchmarks/h200_sweep.sbatch                      # sweep with profiler traces
 ```
 
 If `--model-dir` is omitted, both model folders
@@ -85,20 +87,167 @@ depend on sequence content.
 
 ## spliceai2-mutbench: single-base substitutions
 
-Times `IncrementalEnsemble` (see the main README) against full passes, in
-two interleaved workloads:
+Times `IncrementalEnsemble` (see the main README) against naive full passes,
+in two interleaved workloads:
 
-- **full:** a complete forward pass for the reference and for each variant
-  sequence, batch 1.
+- **full (naive):** a complete forward pass (`Ensemble`, the plain
+  full-pass code) for the reference and for each variant sequence, in
+  batches of `--full-batch-size`. The last batch is padded by repeating its
+  final sequence. The padding is timed, but per-prediction rates count only
+  real predictions.
 - **incremental:** one reference pass, then the variants in batches of
   `--variant-batch-size`.
 
-Both workloads use the same code paths, so the comparison isolates the
-recomputation that is saved. Before timing, it checks:
+Both batch sizes default to `auto`, which works like `--variant-batch-size
+auto` of `spliceai2-ism`:
+
+- two small batches of each path run eagerly, with the incremental
+  reference cache resident as it is during timing;
+- their peak memory gives a fixed part plus a cost per item;
+- `auto` is the largest batch within 80% of the available memory, rounded
+  down to a multiple of 8 and capped at the number of items.
+
+The report and JSON also give the *ceiling*: the largest batch the same
+estimate allows in all of the memory. Pass an integer to fix a size.
+
+If the second probe batch runs out of memory, the estimate uses the memory
+held before probing (models and cache) as its second point. If even batch 1
+runs out of memory eagerly, the estimate is 1, and the run still tries it
+compiled, which usually needs less memory. The probe never stops the run
+itself.
+
+Before timing, it checks:
 
 - each variant's incremental prediction against its full pass;
-- both paths against the original `Ensemble` code, on a short sequence in
+- both paths against the original model code, on a short sequence in
   eager mode.
+
+Other options:
+
+- `--warm-seconds N`: after compilation, run both workloads untimed for N
+  seconds, so timing starts at steady clocks and temperature. Telemetry
+  before and after is logged.
+- `--only full|incremental`: time one workload only. The accuracy checks
+  still run both.
+- `--profile-dir DIR`: profile after timing (see below).
+- Running out of GPU memory exits with code 3.
+
+## Profiling
+
+`--profile-dir DIR` (on `spliceai2-mutbench` and `spliceai2-bench`) runs
+`torch.profiler` over `--profile-iters` warm iterations (default 3, after
+one untimed one), once timing is done:
+
+- **mutbench workloads:** `full` (the first three batches),
+  `incremental_reference` (the reference pass) and `incremental_variants`
+  (two variant batches);
+- **bench workload:** `fixed` (its first three batches).
+
+Each writes:
+
+- `<name>.trace.json`: Chrome trace; open it in <https://ui.perfetto.dev>
+  or `chrome://tracing`. Stages are named ranges such as `full/1d`,
+  `full/2d`, `incremental_variants/var_1d`.
+- `<name>.kernels.txt`: operators and kernels by self GPU time.
+
+With `--profile-stacks` it also records Python call stacks and writes, for
+GPU and for CPU self time:
+
+- `<name>.flame_gpu.svg`, `<name>.flame_cpu.svg`: flamegraphs. Open them in
+  a browser; hover a frame to see its time, click it to zoom, and click the
+  root to reset. GPU time is attributed to the operator that launched each
+  kernel.
+- `<name>.stacks_gpu.txt`, `<name>.stacks_cpu.txt`: the same data as folded
+  stacks, for <https://www.speedscope.app> or `flamegraph.pl`.
+
+Under `torch.compile` the stacks end at the compiled graph. Profile once
+with `--no-compile` to see time per module. Stack recording slows the
+profiled iterations only, not the timed rounds.
+`spliceai2-sweep --profile --profile-stacks` passes the flag to every run,
+and `h200_sweep.sbatch` uses it.
+
+### Comparing runs: differential flamegraphs
+
+Diffs are written in addition to each run's own flamegraphs, which stay as
+they are.
+
+```bash
+uv run spliceai2-flamediff A/full.stacks_gpu.txt B/full.stacks_gpu.txt -o diff.svg
+```
+
+- **Normalisation:** times are per prediction by default. Each profile
+  writes `<name>.meta.json` with its iterations and predictions per
+  iteration, so different batch sizes, or naive vs incremental, compare
+  like for like. Use `--per iteration` or `--per raw` for the other units.
+- **Widths and colours:** frame widths follow B. Red frames are slower in
+  B, blue frames faster, and stronger colours mean larger changes; grey is
+  unchanged. Hover a frame for A, B and Δ. `--width-from a` draws A's
+  widths instead, which shows frames that B no longer has.
+- **Which pairs work best:** the same workload at different batch sizes or
+  layouts. Naive and incremental run different compiled graphs, so with
+  `torch.compile` their diff is mostly frames found in only one of them;
+  compare them with `--no-compile` runs.
+
+`spliceai2-sweep --profile-stacks` writes these automatically to `diffs/`:
+
+- on each axis, every run against the axis's first run, per workload;
+- consecutive against random, per axis, at the largest batch size both
+  layouts ran.
+
+With `--profile`, `sweep.md` also gets a table of the top GPU kernels per
+workload, in µs per prediction across the batch sizes, to show which
+kernels scale and which don't.
+
+The report and JSON (`profile`) give, per iteration:
+
+- the summed GPU kernel time;
+- the CPU operator time, which includes profiler overhead (CPU time close
+  to or above GPU time means the workload is launch-bound);
+- the number of kernel launches;
+- the top kernels.
+
+## spliceai2-sweep: batch sizes, naive vs incremental
+
+Finds how throughput of each path scales with batch size, up to what fits
+in GPU memory, on warm GPUs. For each layout in `--layouts` (default both
+`random` and `consecutive`) there are two axes:
+
+- **naive:** `--full-batch-size` 1, 2, 4, 8, …, with the incremental
+  workload at `auto` in the same run, which also gives a same-run speedup.
+- **incremental:** `--variant-batch-size` 1, 2, 4, …, with `--only
+  incremental`, so the slow full passes are not timed.
+
+How each axis proceeds:
+
+- **Doubling:** the batch size doubles from `--start-batch` until a run
+  runs out of GPU memory or reaches the number of items.
+- **Ceiling run:** after an out-of-memory run, one more run uses the
+  ceiling of the last successful run, if it lies between the last size that
+  fit and the one that did not.
+- **Isolation:** every run is its own `spliceai2-mutbench` process, with
+  `--warm-seconds` (default 60) and `--repeats` (default 2).
+
+The layouts are compared because they behave differently:
+
+- the naive path costs the same for both, so it serves as a control;
+- incremental batches of adjacent substitutions share nearly the same cone,
+  while random ones are spread out, so throughput and the largest batch can
+  differ.
+
+Output in `results/sweep-<timestamp>/` (or `--out-dir`):
+
+- per-run JSON and logs (and with `--profile`, traces in
+  `<run>.profile/`);
+- `sweep.json` and `sweep.md`, rewritten after every axis. They hold:
+  - the best naive vs best incremental throughput per layout, and the
+    speedup;
+  - the largest batch that fit and the first that ran out of memory;
+  - random vs consecutive;
+  - one table per layout and axis.
+
+`benchmarks/h200_sweep.sbatch` runs the sweep with `--profile` on one H200.
+Most of the time goes to the naive axis: every run times 500 full forward
+passes per round.
 
 ## spliceai2-suite: everything in one command
 
@@ -110,6 +259,8 @@ By default every benchmark makes 500 predictions of 100,000 positions:
 | variable | `spliceai2-bench` | 500 sequences, lengths ~ N(100k, 10k), bucketed |
 | random substitutions | `spliceai2-mutbench --layout random` | reference + 499 substitutions at random positions |
 | consecutive substitutions | `spliceai2-mutbench --layout consecutive` | reference + 499 substitutions at adjacent positions |
+
+The full passes of the substitution benchmarks use `--full-batch-size auto`.
 
 - **Isolation:** each benchmark runs in its own process.
 - **Output:** each benchmark's JSON and log, plus `summary.md` and

@@ -29,13 +29,15 @@ PROBE_SIZES = (1, 5)
 def fit_batch_size(peaks, capacity, fraction=MEMORY_FRACTION,
                    cap=MAX_BATCH_SIZE, multiple=MULTIPLE):
     """Largest batch size whose extrapolated peak fits in ``fraction`` of
-    ``capacity`` bytes. ``peaks``: {batch size: peak bytes} for two sizes.
-    Returns (batch size, fixed bytes, bytes per SNV)."""
+    ``capacity`` bytes. ``peaks``: {batch size: peak bytes} for two sizes;
+    ``cap=None`` for no upper limit. Returns (batch size, fixed bytes, bytes
+    per SNV)."""
     (b1, p1), (b2, p2) = sorted(peaks.items())
     per_snv = max((p2 - p1) / (b2 - b1), 1.0)
     fixed = p1 - per_snv * b1
     n = int((fraction * capacity - fixed) // per_snv)
-    n = min(n, cap)
+    if cap is not None:
+        n = min(n, cap)
     if n >= multiple:
         n -= n % multiple
     return max(n, 1), fixed, per_snv

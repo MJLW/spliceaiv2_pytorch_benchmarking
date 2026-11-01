@@ -3,20 +3,27 @@
 By default 100 predictions: the reference and 99 random substitutions in its
 output region, each scored with the 1D and 2D heads under FP16 autocast and
 torch.compile. They are produced two ways in the same process:
-  * full:        a complete forward pass per sequence, batch 1;
+  * full:        naive, a complete forward pass per sequence (``Ensemble``,
+                 the plain full-pass code), in batches of --full-batch-size;
   * incremental: one pass of the reference that keeps per-block activations,
                  then batches of variants that recompute only what each
                  substitution can change (see spliceai2_ism.incremental).
-Both use IncrementalEnsemble's code, so the comparison isolates the
-recomputation saved. Before timing, each variant's incremental prediction is
-compared with its full pass, and both paths are checked against the original
-model on a short sequence.
+Both batch sizes default to ``auto``: the largest batch whose peak memory,
+measured eagerly on two small batches, fits in 80% of the GPU. Before
+timing, each variant's incremental prediction is compared with its full
+pass, and both paths are checked against the original model on a short
+sequence.
 
 Measurements are interleaved as in spliceai2-bench: each pass alternates the
 two workloads' items, the order reverses every round (ABBA), and GPU-timed
 and end-to-end passes swap order every round. In reversed passes the
 incremental variants run before the reference pass; they use the cache of
-the previous pass, which holds identical values.
+the previous pass, which holds identical values. --warm-seconds runs both
+workloads untimed first, so timing starts at steady clocks and temperature;
+--profile-dir writes torch.profiler traces of the warm state afterwards.
+
+Running out of GPU memory exits with code 3 (OOM_EXIT), so spliceai2-sweep
+can tell it from other failures.
 """
 import argparse
 import contextlib
@@ -31,15 +38,32 @@ import torch
 import torch._dynamo
 
 from spliceai2_bench.benchmark import fmt_telemetry, gpu_telemetry, summarize
+from spliceai2_bench.profiling import label, profile_workload
 from spliceai2_bench.workloads import interleave
+from spliceai2_ism.batching import MEMORY_FRACTION, MULTIPLE, fit_batch_size
 from spliceai2_ism.encode import one_hot_encode, random_sequences
 from spliceai2_ism.incremental import IncrementalEnsemble
-from spliceai2_ism.predict import predict_full
+from spliceai2_ism.predict import Ensemble, predict_full
 from spliceai2_ism.runtime import environment_info, forbid_eager_fallback
 from spliceai2_ism.weights import checkpoint_paths, download_models, load_model
 
 BASES = "ACGT"
 WORKLOADS = ("full", "incremental")
+OOM_EXIT = 3
+FULL_PROBE_SIZES = (1, 2)
+VARIANT_PROBE_SIZES = (1, 5)
+
+
+def _batch_size(value):
+    if value == "auto":
+        return value
+    try:
+        n = int(value)
+    except ValueError:
+        n = 0
+    if n < 1:
+        raise argparse.ArgumentTypeError("a positive integer or 'auto'")
+    return n
 
 
 def parse_args(argv=None):
@@ -58,8 +82,14 @@ def parse_args(argv=None):
                    default="random",
                    help="random positions, or adjacent positions starting at "
                         "a random offset")
-    p.add_argument("--variant-batch-size", type=int, default=9,
-                   help="substitutions per incremental batch")
+    p.add_argument("--full-batch-size", type=_batch_size, default="auto",
+                   help="sequences per full forward pass, or 'auto': the "
+                        "largest that fits in GPU memory")
+    p.add_argument("--variant-batch-size", type=_batch_size, default="auto",
+                   help="substitutions per incremental batch, or 'auto'")
+    p.add_argument("--only", choices=WORKLOADS,
+                   help="time only this workload (the accuracy checks still "
+                        "run both)")
     p.add_argument("--out-2d-len", type=int, default=1024,
                    help="candidate sites per prediction for the junction head")
     p.add_argument(
@@ -77,8 +107,19 @@ def parse_args(argv=None):
         "--cudnn-benchmark", action="store_true",
         help="enable cuDNN autotuning (left off by the reference)",
     )
+    p.add_argument("--warm-seconds", type=float, default=0,
+                   help="run both workloads untimed for this long before "
+                        "timing, to reach steady GPU clocks and temperature")
     p.add_argument("--repeats", type=int, default=4,
                    help="rounds; an even number balances the ABBA order")
+    p.add_argument("--profile-dir", type=Path,
+                   help="write torch.profiler traces of each workload here, "
+                        "after timing")
+    p.add_argument("--profile-iters", type=int, default=3,
+                   help="profiled iterations per workload")
+    p.add_argument("--profile-stacks", action="store_true",
+                   help="also record Python stacks and write GPU and CPU "
+                        "flamegraphs (SVG) next to the traces")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--json-out", type=Path)
     return p.parse_args(argv)
@@ -109,6 +150,10 @@ def encode(seq):
     return torch.from_numpy(one_hot_encode(seq))[None]
 
 
+def encode_many(seqs):
+    return torch.from_numpy(np.stack([one_hot_encode(s) for s in seqs]))
+
+
 @contextlib.contextmanager
 def inference():
     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
@@ -116,10 +161,12 @@ def inference():
 
 
 class Stages:
-    """Compiled stages. Full and incremental reference passes share theirs:
-    same shapes, so the same kernels."""
+    """Compiled stages: batched full passes (``Ensemble``), and the
+    incremental reference pass and variant batches."""
 
-    def __init__(self, inc, compile_):
+    def __init__(self, inc, ens, compile_):
+        self.full_1d = lambda x: ens.trunk_1d(x)
+        self.full_2d = lambda ftrs, out_ss: ens.head_2d(ftrs, out_ss)
         self.ref_1d = lambda x: inc.reference_1d(x)
         self.ref_2d = lambda z, out_ss: inc.head_2d(z, out_ss)
         self.var_1d = lambda cache, ref_ss, pos, alt: inc.variants_track(
@@ -129,39 +176,58 @@ class Stages:
             z, out_ss, pos, z_var
         )
         if compile_:
-            for name in ("ref_1d", "ref_2d", "var_1d", "var_2d"):
+            for name in ("full_1d", "full_2d", "ref_1d", "ref_2d", "var_1d",
+                         "var_2d"):
                 setattr(self, name,
                         torch.compile(getattr(self, name), dynamic=False))
 
 
+def full_batches(n, batch_size):
+    """Sequence indices per batch, the last one padded by repeating its final
+    sequence so every batch has the same shape, and the real count per
+    batch."""
+    out = []
+    for s in range(0, n, batch_size):
+        idx = list(range(s, min(s + batch_size, n)))
+        out.append((idx + idx[-1:] * (batch_size - len(idx)), len(idx)))
+    return out
+
+
 class FullWorkload:
-    """A complete forward pass per sequence: the reference, then each
-    variant sequence."""
+    """Complete forward passes of the reference and each variant sequence,
+    ``batch_size`` sequences at a time."""
 
     name = "full"
 
-    def __init__(self, seqs, stages, device):
+    def __init__(self, seqs, batch_size, stages, device):
         self.seqs, self.stages, self.device = seqs, stages, device
-        self.inputs = [encode(s).pin_memory() for s in seqs]
+        self.batches = full_batches(len(seqs), batch_size)
+        self.inputs = [self._encode(i).pin_memory()
+                       for i in range(len(self.batches))]
         self.peak_mem = 0
 
     def __len__(self):
-        return len(self.seqs)
+        return len(self.batches)
 
     def predictions(self, i):
-        return 1
+        return self.batches[i][1]
+
+    def _encode(self, i):
+        return encode_many([self.seqs[j] for j in self.batches[i][0]])
 
     def load(self, i, from_string=False):
-        x = encode(self.seqs[i]).pin_memory() if from_string else self.inputs[i]
+        x = self._encode(i).pin_memory() if from_string else self.inputs[i]
         return x.to(self.device, non_blocking=True)
 
     def run(self, x, between=None):
         """Returns (out_ss, idxs, out_jxn); ``between`` runs after stage 1D."""
         with inference():
-            cache, out_ss = self.stages.ref_1d(x)
+            with label("1d"):
+                ftrs, out_ss = self.stages.full_1d(x)
             if between is not None:
                 between()
-            idxs, out_jxn = self.stages.ref_2d(cache[1], out_ss)
+            with label("2d"):
+                idxs, out_jxn = self.stages.full_2d(ftrs, out_ss)
         return out_ss, idxs, out_jxn
 
 
@@ -210,20 +276,24 @@ class IncrementalWorkload:
             if isinstance(inp, torch.Tensor):
                 # free the old cache before building anew
                 self.cache = self.ref_ss = None
-                self.cache, self.ref_ss = self.stages.ref_1d(inp)
+                with label("ref_1d"):
+                    self.cache, self.ref_ss = self.stages.ref_1d(inp)
                 if between is not None:
                     between()
                 out_ss = self.ref_ss
-                idxs, out_jxn = self.stages.ref_2d(self.cache[1], out_ss)
+                with label("ref_2d"):
+                    idxs, out_jxn = self.stages.ref_2d(self.cache[1], out_ss)
             else:
                 pos, alt = inp
-                z_var, out_ss = self.stages.var_1d(self.cache, self.ref_ss,
-                                                   pos, alt)
+                with label("var_1d"):
+                    z_var, out_ss = self.stages.var_1d(self.cache, self.ref_ss,
+                                                       pos, alt)
                 if between is not None:
                     between()
-                idxs, out_jxn = self.stages.var_2d(
-                    self.cache[1], out_ss, pos, z_var
-                )
+                with label("var_2d"):
+                    idxs, out_jxn = self.stages.var_2d(
+                        self.cache[1], out_ss, pos, z_var
+                    )
         return out_ss, idxs, out_jxn
 
 
@@ -233,6 +303,100 @@ def to_host(w, i, out):
     out_ss, idxs, out_jxn = (t[:n] for t in out)
     return (out_ss.sigmoid().float().cpu(), idxs.cpu(),
             out_jxn.sigmoid().float().cpu())
+
+
+def probe_peaks(fn, sizes):
+    """Peak allocated bytes of ``fn(b)`` per batch size b, smallest first,
+    stopping at the first size that runs out of memory."""
+    peaks = {}
+    for b in sizes:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        try:
+            out = fn(b)
+            torch.cuda.synchronize()
+        except torch.cuda.OutOfMemoryError:
+            out = None
+        if out is None:  # outside the except block, so its tensors are freed
+            torch.cuda.empty_cache()
+            break
+        peaks[b] = torch.cuda.max_memory_allocated()
+        del out
+    return peaks
+
+
+def fit_probe(peaks, baseline, capacity, fraction, multiple):
+    """(batch size, fixed bytes, bytes per item) from probe peaks. With one
+    peak, the memory held before the probe (``baseline``: models and
+    cache) stands in for the second point; with none, the estimate is
+    unknown and the size is 1, so the run still tries it (compiled stages
+    usually need less memory than the eager probe)."""
+    if not peaks:
+        return 1, None, None
+    if len(peaks) == 1:
+        peaks = {0: baseline, **peaks}
+    return fit_batch_size(peaks, capacity, fraction, cap=None,
+                          multiple=multiple)
+
+
+def measure_batch_sizes(inc, ens, seq, seq_len, n_full, n_var, device):
+    """Batch sizes from eager peak memory of small batches, measured with
+    the incremental reference cache resident, as during timing.
+
+    Returns, per path ("full", "variant"), the size ``auto`` picks (largest
+    within MEMORY_FRACTION of the memory, a multiple of 8) and the
+    ``ceiling`` (largest within all of it), both capped at the number of
+    items, plus the measurements.
+    """
+    x = encode(seq).to(device)
+    with inference():
+        cache, ref_ss = inc.reference_1d(x)
+        torch.cuda.synchronize()
+        baseline = torch.cuda.memory_allocated()
+
+        def full(b):
+            ftrs, out_ss = ens.trunk_1d(x.expand(b, -1, -1))
+            return ens.head_2d(ftrs, out_ss)
+
+        def variants(b):
+            pos = torch.linspace(0, seq_len - 1, b, device=device).long()
+            alt = torch.zeros(b, dtype=torch.long, device=device)
+            z_var, var_ss = inc.variants_track(cache, ref_ss, pos, alt)
+            return inc.head_2d(cache[1], var_ss, pos, z_var)
+
+        peaks = {"full": probe_peaks(full, FULL_PROBE_SIZES),
+                 "variant": probe_peaks(variants, VARIANT_PROBE_SIZES)}
+    del cache, ref_ss, x
+    torch.cuda.empty_cache()
+    free, total = torch.cuda.mem_get_info()
+    capacity = free + torch.cuda.memory_reserved()
+    limits = {"full": n_full, "variant": n_var}
+    sizes = {"full": FULL_PROBE_SIZES, "variant": VARIANT_PROBE_SIZES}
+
+    def fit(path, fraction, multiple):
+        n, fixed, per_item = fit_probe(peaks[path], baseline, capacity,
+                                       fraction, multiple)
+        return min(n, limits[path]), fixed, per_item
+
+    out = {"auto": {}, "ceiling": {}, "fixed_bytes": {},
+           "bytes_per_item": {}, "probe_oom_at": {}}
+    for path in peaks:
+        out["auto"][path], fixed, per_item = fit(path, MEMORY_FRACTION,
+                                                 MULTIPLE)
+        out["ceiling"][path] = fit(path, 1.0, 1)[0]
+        out["fixed_bytes"][path] = fixed
+        out["bytes_per_item"][path] = per_item
+        missing = [b for b in sizes[path] if b not in peaks[path]]
+        out["probe_oom_at"][path] = missing[0] if missing else None
+    out.update({
+        "peak_bytes": {path: {str(b): p for b, p in pk.items()}
+                       for path, pk in peaks.items()},
+        "baseline_bytes": baseline,
+        "capacity_bytes": capacity,
+        "total_bytes": total,
+        "fraction": MEMORY_FRACTION,
+    })
+    return out
 
 
 def warmup(w, i):
@@ -252,6 +416,20 @@ def warmup(w, i):
     w.run(w.load(i))  # settle allocator / autotuning
     torch.cuda.synchronize()
     return {"1d": marks[0] - t0, "2d": t1 - marks[0]}
+
+
+def warm_for(workloads, schedule, seconds):
+    """Runs the schedule untimed, over and over, for ``seconds``; returns
+    the number of items run."""
+    t_end, n = time.perf_counter() + seconds, 0
+    while True:
+        for k, i in schedule:
+            if time.perf_counter() >= t_end:
+                return n
+            w = workloads[k]
+            w.run(w.load(i))
+            torch.cuda.synchronize()
+            n += 1
 
 
 def gpu_pass(workloads, schedule):
@@ -341,33 +519,62 @@ def check_against_original(models, inc, args, device):
 
 
 def check_against_full(full, incr):
-    """Every variant's incremental prediction vs its full pass (untimed)."""
-    ours, theirs = [], []
+    """Every variant's incremental prediction vs its full pass (untimed).
+    Sequence 0 of the full workload is the reference, sequence 1 + j the
+    j-th substitution."""
+    ours, start = {}, 1
     for i in range(1, len(incr)):
         out = incr.run(incr.load(i))
-        start = sum(incr.predictions(j) for j in range(1, i))
         for j in range(incr.predictions(i)):
-            ours.append(tuple(t[j] for t in out))
-            theirs.append(tuple(t[0] for t in full.run(full.load(1 + start + j))))
-    return compare(ours, theirs)
+            ours[start + j] = tuple(t[j].cpu() for t in out)
+        start += incr.predictions(i)
+    mine, theirs = [], []
+    for i, (idx, n) in enumerate(full.batches):
+        out = full.run(full.load(i))
+        for row in range(n):
+            if idx[row] in ours:
+                mine.append(ours[idx[row]])
+                theirs.append(tuple(t[row].cpu() for t in out))
+    return compare(mine, theirs)
 
 
-def stage_summary(gpu_rounds, e2e_rounds, items):
+def stage_summary(gpu_rounds, e2e_rounds, items, n_predictions):
     g1 = [sum(rnd[i][0] for i in items) for rnd in gpu_rounds]
     g2 = [sum(rnd[i][1] for i in items) for rnd in gpu_rounds]
+    gpu = [a + b for a, b in zip(g1, g2)]
+    e2e = [sum(rnd[i] for i in items) for rnd in e2e_rounds]
     return {
+        "n_predictions": n_predictions,
         "gpu_s": {
             "1d": summarize(g1),
             "2d": summarize(g2),
-            "total": summarize([a + b for a, b in zip(g1, g2)]),
+            "total": summarize(gpu),
         },
-        "end_to_end_s": summarize([sum(rnd[i] for i in items)
-                                   for rnd in e2e_rounds]),
+        "end_to_end_s": summarize(e2e),
+        "predictions_per_s": {
+            "gpu": n_predictions / statistics.median(gpu),
+            "e2e": n_predictions / statistics.median(e2e),
+        },
     }
 
 
 def main(argv=None):
     args = parse_args(argv)
+    chosen = {}
+    try:
+        run(args, chosen)
+    except RuntimeError as e:  # torch.cuda.OutOfMemoryError included
+        if not (isinstance(e, torch.cuda.OutOfMemoryError)
+                or "out of memory" in str(e).lower()):
+            raise
+        print(f"\nout of GPU memory (full batch "
+              f"{chosen.get('full', args.full_batch_size)}, variant batch "
+              f"{chosen.get('variant', args.variant_batch_size)}): {e}",
+              file=sys.stderr, flush=True)
+        sys.exit(OOM_EXIT)
+
+
+def run(args, chosen):
     if not torch.cuda.is_available():
         sys.exit("a CUDA GPU is required")
     device = torch.device("cuda")
@@ -378,6 +585,7 @@ def main(argv=None):
     model_dir = args.model_dir or download_models()
     models = [load_model(p) for p in checkpoint_paths(model_dir)]
     inc = IncrementalEnsemble(models, args.out_2d_len).eval().to(device)
+    ens = Ensemble(list(inc.models), args.out_2d_len).eval()  # same modules
     torch.cuda.synchronize()
     load_s = time.perf_counter() - t0
 
@@ -390,6 +598,8 @@ def main(argv=None):
             sys.exit(f"--out-2d-len must not exceed {flag}")
     if not 1 <= args.n_mutations <= args.seq_len:
         sys.exit("--n-mutations must be between 1 and --seq-len")
+    if args.profile_stacks and not args.profile_dir:
+        sys.exit("--profile-stacks needs --profile-dir")
 
     print("Checking both paths against the original model "
           f"(eager, {args.check_len:,} positions)...", flush=True)
@@ -403,20 +613,43 @@ def main(argv=None):
                                            args.layout)
     seqs = [seq] + [apply_substitution(seq, m.crop_len, p, a)
                     for p, a in zip(positions, alts)]
-    stages = Stages(inc, compile_)
-    full = FullWorkload(seqs, stages, device)
-    incr = IncrementalWorkload(seq, positions, alts, args.variant_batch_size,
+
+    print("Measuring memory per batch item (eager)...", flush=True)
+    sizing = measure_batch_sizes(inc, ens, seq, args.seq_len, len(seqs),
+                                 args.n_mutations, device)
+    requested = {"full": args.full_batch_size,
+                 "variant": args.variant_batch_size}
+    for path, b in requested.items():
+        chosen[path] = sizing["auto"][path] if b == "auto" else b
+    for path, what, unit, div in (("full", "sequence", "GiB", 2**30),
+                                  ("variant", "variant", "MiB", 2**20)):
+        per_item = sizing["bytes_per_item"][path]
+        cost = ("did not fit even at batch 1 (eager); trying anyway"
+                if per_item is None else f"{per_item / div:,.2f} {unit} per "
+                f"{what}, ceiling {sizing['ceiling'][path]}")
+        oom = sizing["probe_oom_at"][path]
+        if per_item is not None and oom is not None:
+            cost += f"; probe ran out of memory at batch {oom}"
+        mode = "auto" if requested[path] == "auto" else "fixed"
+        print(f"  {path} batch {chosen[path]} ({mode}; {cost})", flush=True)
+    print(f"  {sizing['capacity_bytes'] / 2**30:.1f} GiB available",
+          flush=True)
+
+    stages = Stages(inc, ens, compile_)
+    full = FullWorkload(seqs, chosen["full"], stages, device)
+    incr = IncrementalWorkload(seq, positions, alts, chosen["variant"],
                                stages, device)
-    workloads = [full, incr]
+    workloads = [w for w in (full, incr)
+                 if args.only is None or w.name == args.only]
 
     if compile_:
         forbid_eager_fallback()
 
     print("Compiling / warming up...", flush=True)
-    warmup_s = {"reference pass": warmup(full, 0)}
-    warmup(incr, 0)  # same compiled stages; builds the cache
-    warmup_s[f"variant batch of {args.variant_batch_size}"] = warmup(incr, 1)
-    for w in workloads:
+    warmup_s = {f"full batch of {chosen['full']}": warmup(full, 0),
+                "reference pass": warmup(incr, 0)}  # builds the cache
+    warmup_s[f"variant batch of {chosen['variant']}"] = warmup(incr, 1)
+    for w in (full, incr):
         for i in range(len(w)):
             w.run(w.load(i))
     torch.cuda.synchronize()
@@ -428,6 +661,18 @@ def main(argv=None):
         torch._dynamo.config.error_on_recompile = True
 
     schedule = interleave([len(w) for w in workloads])
+    warm = None
+    if args.warm_seconds > 0:
+        print(f"Warming the GPU for {args.warm_seconds:.0f} s...", flush=True)
+        before = gpu_telemetry()
+        t_start = time.perf_counter()
+        items = warm_for(workloads, schedule, args.warm_seconds)
+        warm = {"seconds": time.perf_counter() - t_start, "items": items,
+                "telemetry_start": before, "telemetry_end": gpu_telemetry()}
+        print(f"  {items} items | "
+              f"{fmt_telemetry(warm['telemetry_start'], warm['telemetry_end'])}",
+              flush=True)
+
     gpu_rounds = {w.name: [] for w in workloads}
     e2e_rounds = {w.name: [] for w in workloads}
     passes = []
@@ -455,27 +700,81 @@ def main(argv=None):
                 "elapsed_s": elapsed, "totals_s": totals,
                 "telemetry_start": before, "telemetry_end": after,
             })
-            print(
-                f"  round {r + 1}/{args.repeats} {mode:<3}  "
-                f"full {totals['full']:7.2f} s  "
-                f"incremental {totals['incremental']:7.2f} s  | "
-                f"{fmt_telemetry(before, after)}",
-                flush=True,
-            )
+            print(f"  round {r + 1}/{args.repeats} {mode:<3}  "
+                  f"{fmt_totals(totals)}  | {fmt_telemetry(before, after)}",
+                  flush=True)
+
+    profile = None
+    if args.profile_dir:
+        print(f"Profiling ({args.profile_iters} iterations per workload)...",
+              flush=True)
+        profile = {}
+        targets = []
+        if full in workloads:
+            targets.append(("full", full, range(min(3, len(full)))))
+        if incr in workloads:
+            targets += [("incremental_reference", incr, [0]),
+                        ("incremental_variants", incr,
+                         range(1, min(3, len(incr))))]
+        for name, w, items in targets:
+            def step(w=w, items=items):
+                for i in items:
+                    w.run(w.load(i))
+            n = sum(w.predictions(i) for i in items)
+            profile[name] = {
+                "predictions_per_iter": n,
+                **profile_workload(name, step, args.profile_dir,
+                                   args.profile_iters,
+                                   stacks=args.profile_stacks,
+                                   predictions_per_iter=n),
+            }
 
     n_in = args.seq_len + m.crop_len
+    n_pred = len(seqs)
+    summaries = {}
+    if full in workloads:
+        summaries["full"] = {
+            **stage_summary(gpu_rounds["full"], e2e_rounds["full"],
+                            range(len(full)), n_pred),
+            "batch_size": chosen["full"],
+            "batches": len(full),
+            "peak_gpu_mem_bytes": full.peak_mem,
+        }
+    if incr in workloads:
+        g, e = gpu_rounds["incremental"], e2e_rounds["incremental"]
+        summaries["incremental"] = {
+            "reference": stage_summary(g, e, [0], 1),
+            "variants": stage_summary(g, e, range(1, len(incr)),
+                                      args.n_mutations),
+            "total": stage_summary(g, e, range(len(incr)), n_pred),
+            "batch_size": chosen["variant"],
+            "peak_gpu_mem_bytes": incr.peak_mem,
+        }
+    speedup = None
+    if len(workloads) == 2:
+        speedup = {
+            mode: summarize([p["totals_s"]["full"]
+                             / p["totals_s"]["incremental"]
+                             for p in passes if p["mode"] == mode])
+            for mode in ("gpu", "e2e")
+        }
     result = {
         "env": environment_info(),
         "config": {
             "seq_len": args.seq_len,
             "n_mutations": args.n_mutations,
             "layout": args.layout,
-            "variant_batch_size": args.variant_batch_size,
+            "full_batch_size": chosen["full"],
+            "variant_batch_size": chosen["variant"],
+            "batch_size_mode": {p: "auto" if b == "auto" else "fixed"
+                                for p, b in requested.items()},
+            "only": args.only,
             "out_2d_len": args.out_2d_len,
             "check_len": args.check_len,
             "compile": compile_,
             "autocast": "float16",
             "cudnn_benchmark": args.cudnn_benchmark,
+            "warm_seconds": args.warm_seconds,
             "repeats": args.repeats,
             "seed": args.seed,
             "num_models": len(models),
@@ -483,6 +782,7 @@ def main(argv=None):
             "num_features": m.num_features,
             "crop_len": m.crop_len,
         },
+        "batch_sizing": sizing,
         "substitutions": {"positions": positions,
                           "alt": [BASES[a] for a in alts]},
         "geometry": {
@@ -494,29 +794,10 @@ def main(argv=None):
         "accuracy": {"original_model": original_check, "full_pass": full_check},
         "load_s": load_s,
         "warmup_s": warmup_s,
-        "workloads": {
-            "full": {
-                **stage_summary(gpu_rounds["full"], e2e_rounds["full"],
-                                range(len(full))),
-                "peak_gpu_mem_bytes": full.peak_mem,
-            },
-            "incremental": {
-                "reference": stage_summary(gpu_rounds["incremental"],
-                                           e2e_rounds["incremental"], [0]),
-                "variants": stage_summary(gpu_rounds["incremental"],
-                                          e2e_rounds["incremental"],
-                                          range(1, len(incr))),
-                "total": stage_summary(gpu_rounds["incremental"],
-                                       e2e_rounds["incremental"],
-                                       range(len(incr))),
-                "peak_gpu_mem_bytes": incr.peak_mem,
-            },
-        },
-        "speedup": {
-            mode: summarize([p["totals_s"]["full"] / p["totals_s"]["incremental"]
-                             for p in passes if p["mode"] == mode])
-            for mode in ("gpu", "e2e")
-        },
+        "warm": warm,
+        "workloads": summaries,
+        "speedup": speedup,
+        "profile": profile,
         "passes": passes,
     }
     print()
@@ -526,9 +807,14 @@ def main(argv=None):
         print(f"\nwrote {args.json_out}")
 
 
+def fmt_totals(totals):
+    return "  ".join(f"{name} {t:7.2f} s" for name, t in totals.items())
+
+
 def print_report(r):
     c, env, g = r["config"], r["env"], r["geometry"]
     n_pred = c["n_mutations"] + 1
+    sizing = r["batch_sizing"]
 
     def fmt(s):
         return f"{s['median']:9.3f} s  [{s['min']:.3f}–{s['max']:.3f}]"
@@ -550,6 +836,16 @@ def print_report(r):
               f"  {per(gs['total'], n, what)}")
         print(f"{indent}end-to-end                         "
               f"{fmt(s['end_to_end_s'])}  {per(s['end_to_end_s'], n, what)}")
+        rate = s["predictions_per_s"]
+        plural = what + ("es" if what.endswith("s") else "s")
+        print(f"{indent}throughput                         "
+              f"{rate['gpu']:9.1f} {plural}/s GPU, {rate['e2e']:.1f} "
+              f"end-to-end")
+
+    def batch(path):
+        mode = c["batch_size_mode"][path]
+        return (f"{c[path + '_batch_size']} ({mode}; ceiling "
+                f"{sizing['ceiling'][path]})")
 
     print("SpliceAI2 substitution benchmark")
     print(f"  GPU                {env['gpu']}")
@@ -567,12 +863,20 @@ def print_report(r):
     if c["layout"] == "consecutive":
         ps = r["substitutions"]["positions"]
         print(f"                     output positions {min(ps):,}–{max(ps):,}")
-    print(f"  incremental        variant batch {c['variant_batch_size']}; a "
-          f"substitution reaches ±{g['reach_nt']:,} nt; "
+    print(f"  batch sizes        full {batch('full')}, variant "
+          f"{batch('variant')}; "
+          f"{sizing['capacity_bytes'] / 2**30:.1f} GiB available")
+    print(f"  incremental        a substitution reaches ±{g['reach_nt']:,} nt; "
           f"{100 * g['recompute_fraction']:.2f}% of a full pass's block "
           f"outputs recomputed per variant")
+    warm = r["warm"]
+    warm_line = ("none" if warm is None else
+                 f"{warm['seconds']:.0f} s untimed, {warm['items']} items; "
+                 f"{fmt_telemetry(warm['telemetry_start'], warm['telemetry_end'])}")
+    print(f"  GPU warm-up        {warm_line}")
     print(f"  timing             {c['repeats']} interleaved rounds (ABBA), "
-          f"median [min–max]")
+          f"median [min–max]"
+          + (f"; only {c['only']} timed" if c["only"] else ""))
     print()
     print("Accuracy, max |Δ probability| (2D: predictions with identical top-k)")
     a = r["accuracy"]
@@ -584,39 +888,59 @@ def print_report(r):
     print()
     print(f"Model load                               {r['load_s']:9.3f} s")
     print("First call (compile + cuDNN setup)")
-    for label, wu in r["warmup_s"].items():
-        print(f"  {label:<28} 1D {wu['1d']:7.3f} s, 2D {wu['2d']:7.3f} s")
+    for label_, wu in r["warmup_s"].items():
+        print(f"  {label_:<28} 1D {wu['1d']:7.3f} s, 2D {wu['2d']:7.3f} s")
 
     w = r["workloads"]
-    print()
-    print(f"Full recompute: {n_pred} forward passes, batch 1")
-    stages(w["full"], n_pred, "prediction")
-    print(f"  Peak GPU memory                    "
-          f"{w['full']['peak_gpu_mem_bytes'] / 2**30:9.2f} GiB")
-    print()
-    print(f"Incremental: reference pass + {c['n_mutations']} variants")
-    print("  reference pass (keeps per-block activations)")
-    stages(w["incremental"]["reference"], 1, "pass")
-    print("  variants")
-    stages(w["incremental"]["variants"], c["n_mutations"], "variant")
-    print("  total")
-    stages(w["incremental"]["total"], n_pred, "prediction")
-    print(f"  Peak GPU memory                    "
-          f"{w['incremental']['peak_gpu_mem_bytes'] / 2**30:9.2f} GiB")
-    print()
+    if "full" in w:
+        print()
+        print(f"Full recompute (naive): {n_pred} forward passes in "
+              f"{w['full']['batches']} batches of {w['full']['batch_size']}")
+        stages(w["full"], n_pred, "prediction")
+        print(f"  Peak GPU memory                    "
+              f"{w['full']['peak_gpu_mem_bytes'] / 2**30:9.2f} GiB")
+    if "incremental" in w:
+        print()
+        print(f"Incremental: reference pass + {c['n_mutations']} variants in "
+              f"batches of {w['incremental']['batch_size']}")
+        print("  reference pass (keeps per-block activations)")
+        stages(w["incremental"]["reference"], 1, "pass")
+        print("  variants")
+        stages(w["incremental"]["variants"], c["n_mutations"], "variant")
+        print("  total")
+        stages(w["incremental"]["total"], n_pred, "prediction")
+        print(f"  Peak GPU memory                    "
+              f"{w['incremental']['peak_gpu_mem_bytes'] / 2**30:9.2f} GiB")
     s = r["speedup"]
-    print("Speedup, full / incremental (median [min–max] of per-pass ratios)")
-    print(f"  GPU time     {s['gpu']['median']:6.1f}×  "
-          f"[{s['gpu']['min']:.1f}–{s['gpu']['max']:.1f}]")
-    print(f"  end-to-end   {s['e2e']['median']:6.1f}×  "
-          f"[{s['e2e']['min']:.1f}–{s['e2e']['max']:.1f}]")
+    if s is not None:
+        print()
+        print("Speedup, full / incremental (median [min–max] of per-pass ratios)")
+        print(f"  GPU time     {s['gpu']['median']:6.1f}×  "
+              f"[{s['gpu']['min']:.1f}–{s['gpu']['max']:.1f}]")
+        print(f"  end-to-end   {s['e2e']['median']:6.1f}×  "
+              f"[{s['e2e']['min']:.1f}–{s['e2e']['max']:.1f}]")
+
+    if r["profile"]:
+        print()
+        print("Profile (per iteration; GPU = summed kernel time)")
+        for name, p in r["profile"].items():
+            print(f"  {name:<22} {p['predictions_per_iter']:4d} predictions, "
+                  f"GPU {p['device_ms_per_iter']:9.1f} ms, CPU ops "
+                  f"{p['cpu_ms_per_iter']:9.1f} ms, "
+                  f"{p['kernel_launches_per_iter']:,.0f} kernel launches")
+            for k in p["top_kernels"][:5]:
+                print(f"    {100 * (k['share'] or 0):5.1f}%  "
+                      f"{k['device_ms_per_iter']:8.2f} ms  {k['name'][:70]}")
+            print(f"    trace {p['trace']}")
+            if "flamegraph_gpu" in p:
+                print(f"    flamegraphs {p['flamegraph_gpu']}, "
+                      f"{p['flamegraph_cpu']}")
 
     print()
     print("Pass log")
     for p in r["passes"]:
-        t = p["totals_s"]
         print(f"  round {p['round']} {p['mode']:<3} {p['order']:<7}  "
-              f"full {t['full']:7.2f} s  incremental {t['incremental']:7.2f} s"
+              f"{fmt_totals(p['totals_s'])}"
               f"  | {fmt_telemetry(p['telemetry_start'], p['telemetry_end'])}")
 
 
