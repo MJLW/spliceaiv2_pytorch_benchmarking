@@ -19,5 +19,7 @@ set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 
 nvidia-smi
+# torch.compile's cache on shared storage (the default is node-local /tmp)
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$PWD/.inductor_cache}"
 uv sync
 uv run spliceai2-suite --out-dir "results/suite-${SLURM_JOB_ID:-local}" "$@"

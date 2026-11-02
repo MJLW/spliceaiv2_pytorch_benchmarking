@@ -12,9 +12,15 @@ uv run spliceai2-bench --heads 1d --json-out results.json
 uv run spliceai2-mutbench                                # reference + 99 substitutions
 uv run spliceai2-suite                                   # all of the above
 uv run spliceai2-sweep                                   # batch-size sweep, naive vs incremental
+uv run spliceai2-ablation                                # each optimization on/off
 sbatch benchmarks/h100_suite.sbatch                      # on a SLURM cluster
 sbatch benchmarks/h200_sweep.sbatch                      # sweep with profiler traces
+sbatch benchmarks/h200_ablation.sbatch                   # ablation on an H200
 ```
+
+The sbatch scripts set `TORCHINDUCTOR_CACHE_DIR` to `.inductor_cache/` in
+the submit directory (unless it is already set), so compiled graphs survive
+between jobs instead of living in node-local `/tmp`.
 
 If `--model-dir` is omitted, both model folders
 (`spliceai2_multispecies_13M_01`, `_02`) are downloaded into the HF cache.
@@ -98,8 +104,9 @@ in two interleaved workloads:
 - **incremental:** one reference pass, then the variants in batches of
   `--variant-batch-size`.
 
-Both batch sizes default to `auto`, which works like `--variant-batch-size
-auto` of `spliceai2-ism`:
+`--full-batch-size` defaults to `auto` and `--variant-batch-size` to 32
+(past which an H200 gains no throughput). `auto` works like
+`--variant-batch-size auto` of `spliceai2-ism`:
 
 - two small batches of each path run eagerly, with the incremental
   reference cache resident as it is during timing;
@@ -122,8 +129,30 @@ Before timing, it checks:
 - both paths against the original model code, on a short sequence in
   eager mode.
 
+With any rewrite enabled it also compares the incremental path with
+`--opts` against the same path with none (eager, FP16, on the short
+sequence: reference and 32 variants), so each rewrite's own effect on the
+outputs is reported separately (`accuracy.vs_unoptimized`).
+
 Other options:
 
+- `--opts SPEC`: which exact rewrites of the incremental path to use (see
+  [Optimizations](../README.md#optimizations)): `all` (default), `none`,
+  names to enable (`stencil_resample,fused_junction`), or `all,-name` to
+  leave one out. The naive path never uses them.
+- `--compile-mode default|reduce-overhead|max-autotune-no-cudagraphs` and
+  `--freezing`: torch.compile settings. Under `reduce-overhead` (CUDA
+  graphs) the reference cache is copied into static buffers after each
+  reference pass, so the variant graphs read it in place.
+- `--e2e-output full|deltas`: what the end-to-end passes produce. `full`
+  copies probability tracks and junction matrices to the CPU, into reused
+  pinned buffers (`--host-copy pinned`, default) or with plain `.cpu()`
+  (`--host-copy pageable`). `deltas` computes sparse deltas against the
+  reference on the GPU and copies only those, as `spliceai2-ism` does
+  (`--min-delta`, default 1e-3; 1D deltas over the whole output region).
+  The end-to-end time is also split into `load` (encode, upload), `run`
+  (both stages) and `to_host` (output), in the report and in
+  `end_to_end_phases_s`.
 - `--warm-seconds N`: after compilation, run both workloads untimed for N
   seconds, so timing starts at steady clocks and temperature. Telemetry
   before and after is logged.
@@ -248,6 +277,31 @@ Output in `results/sweep-<timestamp>/` (or `--out-dir`):
 `benchmarks/h200_sweep.sbatch` runs the sweep with `--profile` on one H200.
 Most of the time goes to the naive axis: every run times 500 full forward
 passes per round.
+
+## spliceai2-ablation: each optimization on and off
+
+Runs `spliceai2-mutbench` once per configuration, each in its own process,
+on one workload: reference + `--n-mutations` (499) `--layout` (random)
+substitutions of `--seq-len` (100,000) positions, variant batch 32, only
+the incremental workload timed.
+
+- `none`, `all`: no rewrite, every rewrite.
+- `only_<name>`, `all_minus_<name>`: each rewrite alone, and every rewrite
+  but that one. The first gives its gain on its own (over `none`), the
+  second its gain on top of the others (`all` over `all_minus_<name>`).
+- `all_freezing`, `all_reduce_overhead`, `all_max_autotune`: compile
+  settings on top of `all`.
+- `all_pageable`, `all_deltas`: end-to-end output variants (plain `.cpu()`
+  copies; sparse deltas as `spliceai2-ism` writes them).
+- `naive`: `all` with the naive full passes timed in the same process,
+  for the speedup over plain SpliceAI2.
+
+`--configs a,b,...` runs a subset. `ablation.md` and `ablation.json` (in
+`results/ablation-<timestamp>/` or `--out-dir`) list each rewrite's gain and,
+per run, GPU throughput, ms per variant (2D part), reference pass, end-to-end
+throughput and phases, peak memory, compile time, and accuracy against the
+naive full passes and against the unoptimized incremental path.
+`benchmarks/h200_ablation.sbatch` runs all of it on one H200.
 
 ## spliceai2-suite: everything in one command
 

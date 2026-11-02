@@ -6,5 +6,8 @@ results*.json
 results/
 mut*.json
 spliceai2-suite-*.out
+spliceai2-*.out
+.inductor_cache/
+profiles/
 
 

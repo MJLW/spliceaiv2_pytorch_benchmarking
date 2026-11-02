@@ -34,13 +34,30 @@ def test_full_batches_pad_last_batch():
     assert full_batches(3, 8) == [([0, 1, 2, 2, 2, 2, 2, 2], 3)]
 
 
-def test_mutbench_batch_sizes_default_to_auto():
+def test_mutbench_batch_size_defaults():
     a = mutbench_args([])
-    assert a.full_batch_size == "auto" and a.variant_batch_size == "auto"
+    assert a.full_batch_size == "auto" and a.variant_batch_size == 32
     a = mutbench_args(["--full-batch-size", "16", "--variant-batch-size", "64"])
     assert a.full_batch_size == 16 and a.variant_batch_size == 64
+    assert mutbench_args(["--variant-batch-size", "auto"]).variant_batch_size \
+        == "auto"
     with pytest.raises(SystemExit):
         mutbench_args(["--full-batch-size", "0"])
+
+
+def test_mutbench_opts_and_compile_flags():
+    from spliceai2_ism.incremental import Optimizations
+    a = mutbench_args([])
+    assert a.opts == Optimizations() and a.compile_mode == "default"
+    assert not a.freezing and a.e2e_output == "full"
+    a = mutbench_args(["--opts", "all,-stencil_resample",
+                       "--compile-mode", "reduce-overhead", "--freezing",
+                       "--e2e-output", "deltas"])
+    assert not a.opts.stencil_resample and a.opts.fused_junction
+    assert a.compile_mode == "reduce-overhead" and a.freezing
+    assert a.e2e_output == "deltas"
+    with pytest.raises(SystemExit):
+        mutbench_args(["--opts", "all,-nonsense"])
 
 
 def test_fit_batch_size_without_cap():

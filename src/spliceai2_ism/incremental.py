@@ -22,17 +22,83 @@ arithmetic:
     outputs, and the pointwise rest of the block (norm, FFN, residual) only
     runs on them.
 
+``Optimizations`` switches further rewrites, also exact in exact arithmetic
+and all on by default (each can be turned off for ablations):
+  * ``stencil_resample``: a linear upsampling by p followed by the next
+    block's average pooling is a fixed 3-tap (same pool) or stride-2 4-tap
+    (pool doubles) filter at pooled resolution; it replaces materialising
+    the full-resolution activations between blocks;
+  * ``grouped_head_upsample``: splice-site head outputs of blocks that share
+    a pooling factor (and of both models) are summed before one upsampling
+    per factor, instead of one per block and model;
+  * ``reference_depthwise``: the reference pass runs the token mixer as
+    shifted products (``_depthwise_same``) instead of PyTorch's generic
+    dilated depthwise kernel;
+  * ``fused_junction``: the junction logits of all blocks and models are one
+    matrix product over their concatenated RoPE queries and keys, with the
+    causal mask applied once;
+  * ``padded_ffn``: the FFN of windows whose width is not a multiple of 8
+    runs on zero-padded columns (dropped afterwards), so the 1x1
+    convolutions get aligned GEMM kernels.
+
 Coordinates: full-resolution positions are model-input positions (0..N-1,
 N = L + crop_len). A substitution at input position p is handled relative to
 its anchor ``a`` = p rounded down to a multiple of ``align``, the deepest
 pooling factor, so every window below covers whole pooling bins at every
 resolution and its shape does not depend on p.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+
+@dataclass(frozen=True)
+class Optimizations:
+    """Exact rewrites of the incremental path (see the module docstring)."""
+
+    stencil_resample: bool = True
+    grouped_head_upsample: bool = True
+    reference_depthwise: bool = True
+    fused_junction: bool = True
+    padded_ffn: bool = True
+
+    @classmethod
+    def names(cls):
+        return [f.name for f in fields(cls)]
+
+    @classmethod
+    def none(cls):
+        return cls(**{name: False for name in cls.names()})
+
+    @classmethod
+    def parse(cls, spec):
+        """From a comma-separated spec: ``all``, ``none``, names to enable,
+        ``-name`` to disable; it starts from ``none`` unless the first item
+        is ``all``. E.g. ``all,-fused_junction`` or ``stencil_resample``."""
+        items = [s.strip() for s in spec.split(",") if s.strip()]
+        opts = cls() if items[:1] == ["all"] else cls.none()
+        for item in items:
+            if item in ("all", "none"):
+                continue
+            name = item.lstrip("-")
+            if name not in cls.names():
+                raise ValueError(f"unknown optimization {name!r}; choose "
+                                 f"from {', '.join(cls.names())}")
+            opts = replace(opts, **{name: not item.startswith("-")})
+        return opts
+
+    def spec(self):
+        on = [n for n in self.names() if getattr(self, n)]
+        if len(on) == len(self.names()):
+            return "all"
+        return ",".join(on) or "none"
+
+
+def _acc(t):
+    """t in its accumulation dtype: at least fp32 (fp64 stays fp64)."""
+    return t.to(torch.promote_types(t.dtype, torch.float32))
 
 
 def _first(v):
@@ -61,11 +127,11 @@ def _depthwise_window(conv, x, start, width):
     k, d, r = _first(conv.kernel_size), _first(conv.dilation), _radius(conv)
     if start < r or start + width + r > x.shape[2]:
         raise ValueError("output slice needs a radius of input on each side")
-    xs = x[..., start - r:start + width + r].float()
-    w = conv.weight.float()
+    xs = _acc(x[..., start - r:start + width + r])
+    w = _acc(conv.weight)
     out = sum(w[:, 0, j, None] * xs[..., j * d:j * d + width] for j in range(k))
     if conv.bias is not None:
-        out = out + conv.bias.float()[:, None]
+        out = out + _acc(conv.bias)[:, None]
     device = x.device.type
     if torch.is_autocast_enabled(device):
         return out.to(torch.get_autocast_dtype(device))
@@ -78,7 +144,22 @@ def _depthwise_same(conv, x):
     return _depthwise_window(conv, F.pad(x, (r, r)), r, x.shape[2])
 
 
-def _block_window(block, x, start, width):
+def _ffn(block, x, pad_to=1):
+    """The block's pointwise FFN branch on x. With ``pad_to`` > 1, x is
+    zero-padded on the right to a multiple of it and the padded columns are
+    dropped again: every column is computed independently, so the real ones
+    are unchanged, and the 1x1 convolutions get aligned GEMM kernels."""
+    width = x.shape[-1]
+    pad = -width % pad_to
+    if pad:
+        x = F.pad(x, (0, pad))
+    out = block._ffn_proj_down(
+        block._ffn_act(block._ffn_proj_up(block._ffn_norm(x)))
+    )
+    return out[..., :width] if pad else out
+
+
+def _block_window(block, x, start, width, pad_to=1):
     """Outputs ``start:start + width`` of MetaFormer.forward on x. The token
     mixer only produces those outputs, and the pointwise rest of the block
     only runs on them."""
@@ -87,9 +168,95 @@ def _block_window(block, x, start, width):
     out = x[..., r:r + width] + _depthwise_window(
         block._token_mixer, block._token_norm(x), r, width
     )
-    return out + block._ffn_proj_down(
-        block._ffn_act(block._ffn_proj_up(block._ffn_norm(out)))
+    return out + _ffn(block, out, pad_to)
+
+
+def _block_same(block, x, pad_to=1):
+    """MetaFormer.forward on the whole of x, with the token mixer as shifted
+    products (``_depthwise_same``)."""
+    out = x + _depthwise_same(block._token_mixer, block._token_norm(x))
+    return out + _ffn(block, out, pad_to)
+
+
+def _pool_taps(src_pool, pool):
+    """Filter weights and stride equivalent to linear upsampling by
+    ``src_pool`` (nn.Upsample, align_corners=False) followed by average
+    pooling by ``pool``, at the coarser resolution.
+
+    For even p, upsampling by p and pooling by p gives each output bin i
+    1/8 of bins i-1 and i+1 and 3/4 of bin i; pooling by 2p averages two
+    neighbouring such bins. Upsampling by 1 is the identity.
+    """
+    if pool not in (src_pool, 2 * src_pool):
+        raise ValueError(f"pooling {src_pool} -> {pool}: must stay or double")
+    stride = pool // src_pool
+    if src_pool == 1:
+        return ((1.0,) if stride == 1 else (0.5, 0.5)), stride
+    if src_pool % 2:
+        raise ValueError(f"pooling factor {src_pool} must be 1 or even")
+    if stride == 1:
+        return (0.125, 0.75, 0.125), 1
+    return (0.0625, 0.4375, 0.4375, 0.0625), 2
+
+
+def _strided_taps(x, taps, stride, start, n):
+    """out[..., i] = sum_j taps[j] * x[..., start + stride * i + j] for
+    i < n, accumulated in fp32 and returned in x's dtype."""
+    xf = _acc(x)
+    end = start + stride * (n - 1) + 1
+    out = sum(w * xf[..., start + j:end + j:stride]
+              for j, w in enumerate(taps))
+    return out.to(x.dtype)
+
+
+def _halo(taps, stride):
+    """Source bins a stencil output needs on each side of its own."""
+    return (len(taps) - stride) // 2
+
+
+def _resample_window(ctx, src_pool, pool, n):
+    """The next block's pooled input from a gathered window ``ctx`` that has
+    one extra source bin per side: equals
+    ``AvgPool1d(pool)(Upsample(src_pool)(ctx)[..., src_pool:src_pool + n * pool])``
+    without the full-resolution intermediate. Every tap lies inside ctx, so
+    the Upsample's edge clamping never applies."""
+    taps, stride = _pool_taps(src_pool, pool)
+    return _strided_taps(ctx, taps, stride, 1 - _halo(taps, stride), n)
+
+
+def _resample_full(z, src_pool, pool):
+    """``AvgPool1d(pool)(Upsample(src_pool)(z))`` over a whole sequence. The
+    Upsample clamps source indices at both ends, which equals replicating
+    the edge bins."""
+    taps, stride = _pool_taps(src_pool, pool)
+    halo = _halo(taps, stride)
+    n = z.shape[-1] // stride
+    if halo:
+        z = F.pad(z, (halo, halo), mode="replicate")
+    return _strided_taps(z, taps, stride, 0, n)
+
+
+def _autocast_dtype(t):
+    device = t.device.type
+    if torch.is_autocast_enabled(device):
+        return torch.get_autocast_dtype(device)
+    return t.dtype
+
+
+def _rope_angles(token_idxs, num_features):
+    """sin and cos of Attention._rope's angles, (B, C / 2, K)."""
+    freqs = 1e4 ** -(
+        torch.arange(0, num_features, 2, device=token_idxs.device)
+        / num_features
     )
+    angle = token_idxs.unsqueeze(1) * freqs.unsqueeze(1).unsqueeze(0)
+    return angle.sin(), angle.cos()
+
+
+def _rope(x, sin, cos):
+    """Attention._rope with precomputed angles."""
+    x1, x2 = x[:, 0::2], x[:, 1::2]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=1)
 
 
 @dataclass(frozen=True)
@@ -162,10 +329,11 @@ class IncrementalEnsemble(nn.Module):
     Splice-site logits are averaged over models as in ``Ensemble``.
     """
 
-    def __init__(self, models, out_2d_len):
+    def __init__(self, models, out_2d_len, opts=None):
         super().__init__()
         self.models = nn.ModuleList(models)
         self.out_2d_len = out_2d_len
+        self.opts = Optimizations() if opts is None else opts
         m = models[0]
         self.num_blocks = m.num_blocks
         self.crop_len = m.crop_len
@@ -192,6 +360,17 @@ class IncrementalEnsemble(nn.Module):
         self.margin = _ceil_to(
             max(0, low - half, high - half, stitch - half), self.align
         )
+        if self.opts.stencil_resample:  # fail early on unsupported pooling
+            for prev, plan in zip(self.plans, self.plans[1:]):
+                _pool_taps(prev.pool, plan.pool)
+        # blocks per pooling factor, in order (grouped_head_upsample)
+        self.pool_groups = {}
+        for b, plan in enumerate(self.plans):
+            self.pool_groups.setdefault(plan.pool, []).append(b)
+
+    @property
+    def _pad_to(self):
+        return 8 if self.opts.padded_ffn else 1
 
     @property
     def window_width(self):
@@ -225,14 +404,25 @@ class IncrementalEnsemble(nn.Module):
         z, h = [], []
         for model in self.models:
             zs, hs = [], []
-            u = model._embed(x.float())
+            xb = model._downsamplers[0](
+                model._embed(x.to(model._embed.weight.dtype))
+            )
             for b, plan in enumerate(self.plans):
-                zb = model._blocks[b](model._downsamplers[b](u))
+                if self.opts.reference_depthwise:
+                    zb = _block_same(model._blocks[b], xb, self._pad_to)
+                else:
+                    zb = model._blocks[b](xb)
                 pad = self.margin // plan.pool
                 zs.append(F.pad(zb[0], (pad, pad)))
                 hs.append(F.pad(model._ss_heads[b](zb)[0], (pad, pad)))
                 if b + 1 < self.num_blocks:
-                    u = model._upsamplers[b](zb)
+                    nxt = self.plans[b + 1].pool
+                    if self.opts.stencil_resample:
+                        xb = _resample_full(zb, plan.pool, nxt)
+                    else:
+                        xb = model._downsamplers[b + 1](
+                            model._upsamplers[b](zb)
+                        )
             z.append(zs)
             h.append(hs)
         return (onehot, z, h), self._stitch_1d(h, x.shape[2])
@@ -252,7 +442,7 @@ class IncrementalEnsemble(nn.Module):
         # gathers come out (C, B, W); convolutions get contiguous (B, C, W)
         x = onehot[:, self._window(a, 1, first.src_start + self.margin,
                                    first.src_width)].permute(1, 0, 2)
-        x = x.float().contiguous()
+        x = x.to(self.models[0]._embed.weight.dtype).contiguous()
         x[torch.arange(len(a), device=x.device), :4, col] = (
             F.one_hot(alt, 4).to(x.dtype)
         )
@@ -260,7 +450,7 @@ class IncrementalEnsemble(nn.Module):
         z_var, h_var = [], []
         for k, model in enumerate(self.models):
             zv, hv = [], []
-            u = model._embed(x)
+            xb = model._downsamplers[0](model._embed(x))
             for b, plan in enumerate(self.plans):
                 if b > 0:
                     # previous output: reference with the variant slice in it
@@ -275,12 +465,17 @@ class IncrementalEnsemble(nn.Module):
                         [ctx[..., :s], zv[-1], ctx[..., s + prev.out_width:]],
                         dim=2,
                     ).contiguous()
-                    u = model._upsamplers[b - 1](ctx)[
-                        ..., plan.src_pool:
-                        plan.src_pool + 2 * plan.context + self.align
-                    ].contiguous()
-                zb = _block_window(model._blocks[b], model._downsamplers[b](u),
-                                   plan.out_crop, plan.out_width)
+                    n_in = 2 * plan.context + self.align  # full resolution
+                    if self.opts.stencil_resample:
+                        xb = _resample_window(ctx, plan.src_pool, plan.pool,
+                                              n_in // plan.pool)
+                    else:
+                        u = model._upsamplers[b - 1](ctx)[
+                            ..., plan.src_pool:plan.src_pool + n_in
+                        ].contiguous()
+                        xb = model._downsamplers[b](u)
+                zb = _block_window(model._blocks[b], xb, plan.out_crop,
+                                   plan.out_width, self._pad_to)
                 zv.append(zb)
                 hv.append(model._ss_heads[b](zb))
             z_var.append(zv)
@@ -309,6 +504,10 @@ class IncrementalEnsemble(nn.Module):
         region."""
         lo = self.margin + self.crop_len // 2
         hi = self.margin + n_in - self.crop_len // 2
+        if self.opts.grouped_head_upsample:
+            return self._upsample_grouped(
+                lambda k, b: h[k][b].unsqueeze(0), lambda p: slice(lo, hi)
+            )
         outs = []
         for model, hk in zip(self.models, h):
             out = 0.0
@@ -324,25 +523,53 @@ class IncrementalEnsemble(nn.Module):
         heads with the variant's slices in them, gathered with one extra bin
         per side for the interpolation, upsampled and cropped."""
         width = self.window_width
+
+        def head(k, b):
+            plan = self.plans[b]
+            pool = plan.pool
+            start = -(self.reach // pool) - 1
+            ctx = h[k][b][:, self._window(
+                a, pool, start + self.margin // pool, width // pool + 2,
+            )].permute(1, 0, 2)
+            s = plan.out_start - start
+            return torch.cat(
+                [ctx[..., :s], h_var[k][b], ctx[..., s + plan.out_width:]],
+                dim=2,
+            )
+
+        if self.opts.grouped_head_upsample:
+            return self._upsample_grouped(
+                head, lambda pool: slice(pool, pool + width)
+            )
         outs = []
         for k, model in enumerate(self.models):
             out = 0.0
             for b, plan in enumerate(self.plans):
                 pool = plan.pool
-                start = -(self.reach // pool) - 1
-                ctx = h[k][b][:, self._window(
-                    a, pool, start + self.margin // pool, width // pool + 2,
-                )].permute(1, 0, 2)
-                s = plan.out_start - start
-                hb = torch.cat(
-                    [ctx[..., :s], h_var[k][b], ctx[..., s + plan.out_width:]],
-                    dim=2,
-                )
                 out = out + (1 / self.num_blocks) * (
-                    model._upsamplers[b](hb)[..., pool:pool + width]
+                    model._upsamplers[b](head(k, b))[..., pool:pool + width]
                 )
             outs.append(out)
         return torch.stack(outs).mean(dim=0)
+
+    def _upsample_grouped(self, head, crop):
+        """Mean over models of the per-block head outputs ``head(k, b)``
+        after upsampling, cropped to ``crop(pool)``: the outputs of all
+        blocks with the same pooling factor, in both models, are summed (in
+        fp32) and upsampled once, which is exact because linear upsampling
+        is linear and their windows coincide."""
+        scale = 1 / (self.num_blocks * len(self.models))
+        out, dtype = None, None
+        for pool, blocks in self.pool_groups.items():
+            acc = 0.0
+            for k in range(len(self.models)):
+                for b in blocks:
+                    hb = head(k, b)
+                    dtype = hb.dtype
+                    acc = acc + _acc(hb)
+            up = self.models[0]._upsamplers[blocks[0]](acc)[..., crop(pool)]
+            out = up if out is None else out + up
+        return (scale * out).to(dtype)
 
     def head_2d(self, z, out_ss, pos=None, z_var=None, valid_len=None):
         """Top-k candidate sites and junction logits, as ``Ensemble.head_2d``.
@@ -361,6 +588,8 @@ class IncrementalEnsemble(nn.Module):
                                         float("-inf"))
         idxs = scores.topk(self.out_2d_len, dim=1)[1].sort(dim=1).values
         sites = idxs + self.crop_len // 2  # input coordinates
+        if self.opts.fused_junction:
+            return idxs, self._junctions_fused(z, z_var, a, sites, idxs)
         outs = []
         for k, model in enumerate(self.models):
             out = 0.0
@@ -374,6 +603,37 @@ class IncrementalEnsemble(nn.Module):
                 )
             outs.append(out)
         return idxs, torch.stack(outs).mean(dim=0)
+
+    def _junctions_fused(self, z, z_var, a, sites, idxs):
+        """The ensemble mean of every block's Attention output as one matrix
+        product. Each block contributes scale / num_blocks * Q_b^T K_b minus
+        1e4 / num_blocks on and below the diagonal; summed over blocks and
+        averaged over models, that is scale / (num_blocks * models) times
+        the product of the concatenated Q and K, minus 1e4 once."""
+        qs, ks, angles = [], [], None
+        for k, model in enumerate(self.models):
+            for b, plan in enumerate(self.plans):
+                feats = self._features_at(
+                    z[k][b], None if z_var is None else z_var[k][b],
+                    plan, a, sites,
+                )
+                att = model._jxn_heads[b]
+                x = att._token_norm(feats.permute(0, 2, 1)).permute(0, 2, 1)
+                if angles is None:
+                    angles = _rope_angles(idxs, att._num_features)
+                q, kk = (_rope(proj(x), *angles)
+                         for proj in (att._query, att._key))
+                # the matmul would cast to this dtype anyway; casting first
+                # halves the memory of the concatenation under autocast
+                qs.append(q.to(_autocast_dtype(q)))
+                ks.append(kk.to(_autocast_dtype(kk)))
+        num_features = self.models[0]._jxn_heads[0]._num_features
+        scale = num_features ** -0.5 / (self.num_blocks * len(self.models))
+        out = scale * torch.einsum("bcl,bcm->blm", torch.cat(qs, dim=1),
+                                   torch.cat(ks, dim=1))
+        n = out.shape[-1]
+        mask = torch.ones(n, n, dtype=out.dtype, device=out.device).tril()
+        return out - 1e4 * mask
 
     def _features_at(self, zb, zv, plan, a, sites):
         """Block output after linear upsampling, at input positions ``sites``
@@ -395,7 +655,7 @@ class IncrementalEnsemble(nn.Module):
                             .unsqueeze(1).expand(-1, zv.shape[1], -1))
             return torch.where(inside.unsqueeze(1), var, ref)
 
-        feats = (1 - w) * at(i0).float() + w * at(i1).float()
+        feats = (1 - w) * _acc(at(i0)) + w * _acc(at(i1))
         return feats.to(zb.dtype).contiguous()
 
     def recompute_fraction(self, n_in):

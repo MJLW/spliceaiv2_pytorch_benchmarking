@@ -42,7 +42,7 @@ sbatch scripts/ism.sbatch --variants ... --regions ... --fasta ... --out-dir ...
 | Option | Default | |
 |---|---|---|
 | `--genes` | all in the variant TSV | optional comma-separated subset, e.g. to split a run over a SLURM job array |
-| `--variant-batch-size` | `auto` | SNVs per incremental batch; `auto` picks the largest that fits in GPU memory (see below) |
+| `--variant-batch-size` | 32 | SNVs per incremental batch; `auto` picks the largest that fits in GPU memory (see below). On an H200, throughput no longer improves past 32 |
 | `--out-2d-len` | 1024 | candidate sites for the junction head (reference default) |
 | `--min-delta` | 1e-3 | smallest \|Δ probability\| written to `deltas.parquet` |
 | `--length-bucket` | 16,384 | gene lengths are rounded up to a multiple of this, so genes share compiled graphs |
@@ -242,6 +242,50 @@ acceptor.
 - **Top-k per SNV:** the junction head picks each SNV's own top-k sites from
   its full splice-site track, as a full pass would.
 
+## Optimizations
+
+What has been done to the incremental path, and what could come next.
+Gains are GPU time per variant on an H200 (reference + 499 random SNVs of
+100 kb). "Pending" means not measured yet; `sbatch
+benchmarks/h200_ablation.sbatch` measures each rewrite alone and on top of
+the others (`results/ablation-<job>/ablation.md`). The naive comparison
+(plain SpliceAI2 full passes, `Ensemble`) never uses any of these.
+
+### Done
+
+Exact rewrites (equal in exact arithmetic; `IncrementalEnsemble(...,
+opts=Optimizations(...))`, all on by default, `--opts` in
+`spliceai2-mutbench`):
+
+| Rewrite (`Optimizations` field) | What | Gain |
+|---|---|---|
+| incremental scheme (baseline) | recompute only each SNV's cone, ~1.3% of a full pass | 15× vs naive (382 vs 25.7 pred/s, batch 32) |
+| `stencil_resample` | linear upsample × p then avg-pool between blocks = 3-tap `[1/8, 3/4, 1/8]` filter (same pool) or stride-2 4-tap `[1/16, 7/16, 7/16, 1/16]` (pool doubles) at pooled resolution; no full-resolution activations | pending (those kernels were ~35% of variant time) |
+| `grouped_head_upsample` | splice-site heads summed per pooling factor (and over both models) before one upsampling: 5 upsamples instead of 40 | pending (~9%) |
+| `reference_depthwise` | reference pass token mixer as fused shifted products instead of PyTorch's generic dilated depthwise kernel | pending (that kernel was 23% of the reference pass) |
+| `fused_junction` | junction logits of all 40 blocks × models as one matmul over concatenated RoPE Q/K, mask applied once | pending (2D stage was ~18%) |
+| `padded_ffn` | FFN of windows with widths not a multiple of 8 (blocks 16-19) run zero-padded, so the 1x1 convolutions get aligned GEMMs instead of `align1` kernels | pending (those GEMMs were ~14%) |
+
+Settings:
+
+| Setting | Gain |
+|---|---|
+| variant batch 32 instead of `auto` (248 on an H200) | same throughput (2.54 ms/variant at 32, 2.59-2.62 at 256-499), 5.2 instead of 28-53 GiB peak memory |
+| `TORCHINDUCTOR_CACHE_DIR=.inductor_cache/` in the sbatch scripts | later jobs skip the ~150 s compile of each graph built before |
+| pinned, reused host buffers for end-to-end outputs (`--host-copy`, benchmark) | pending; end-to-end throughput dropped up to 3.8× in some runs with plain `.cpu()` |
+| Inductor freezing, `reduce-overhead` (CUDA graphs), `max-autotune-no-cudagraphs` (benchmark flags only) | pending |
+
+### Possible later
+
+| Idea | Exact? | Why not yet |
+|---|---|---|
+| share reference-context gathers between SNVs with the same anchor (16 nt bin) | yes | ~1 ms of an ~80 ms batch; needs data-dependent shapes, which break the static compiled graphs |
+| reuse the reference's junction Q/K at sites outside each block's changed region | yes | complex bookkeeping (per block and SNV: changed sites, new top-k sites, row/column updates); the last 4 blocks change nearly every site anyway |
+| overlap GPU work with writing results in `spliceai2-ism` (writer thread) | yes | measure first: compare its logged SNVs/s with the benchmark's GPU rate |
+| CUDA graphs in `spliceai2-ism` | yes | only if `reduce-overhead` wins in the benchmark; needs the cache in persistent, static buffers |
+| truncate the cone of the deepest blocks (e.g. to ±10 kb instead of ±56 kb) | no | most of the remaining work is in the last 4 blocks' wide windows; the error per cutoff would have to be measured against full passes |
+| skip the junction head for SNVs whose largest 1D delta is below `--min-delta` | no | junction deltas of such SNVs would be lost; only safe if they are not needed |
+
 ## Tests
 
 ```bash
@@ -259,4 +303,5 @@ needs the Hugging Face login and takes several minutes, mostly compilation.
 
 The runtime benchmarks this project started from are in
 [`benchmarks/`](benchmarks/README.md) (`spliceai2-bench`,
-`spliceai2-mutbench`, `spliceai2-suite`).
+`spliceai2-mutbench`, `spliceai2-suite`, `spliceai2-sweep`,
+`spliceai2-ablation`).

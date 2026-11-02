@@ -24,4 +24,7 @@ cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 
 nvidia-smi
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# torch.compile's cache on shared storage (the default is node-local /tmp),
+# so later jobs skip the compile of graphs an earlier job already built
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$PWD/.inductor_cache}"
 uv run spliceai2-ism "$@"

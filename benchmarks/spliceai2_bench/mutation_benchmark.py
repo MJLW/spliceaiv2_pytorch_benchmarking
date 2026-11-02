@@ -36,22 +36,32 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch._dynamo
+import torch.utils._pytree as pytree
 
 from spliceai2_bench.benchmark import fmt_telemetry, gpu_telemetry, summarize
 from spliceai2_bench.profiling import label, profile_workload
 from spliceai2_bench.workloads import interleave
 from spliceai2_ism.batching import MEMORY_FRACTION, MULTIPLE, fit_batch_size
+from spliceai2_ism.deltas import delta_2d, haplotype_rows
 from spliceai2_ism.encode import one_hot_encode, random_sequences
-from spliceai2_ism.incremental import IncrementalEnsemble
+from spliceai2_ism.incremental import IncrementalEnsemble, Optimizations
 from spliceai2_ism.predict import Ensemble, predict_full
 from spliceai2_ism.runtime import environment_info, forbid_eager_fallback
 from spliceai2_ism.weights import checkpoint_paths, download_models, load_model
 
 BASES = "ACGT"
 WORKLOADS = ("full", "incremental")
+COMPILE_MODES = ("default", "reduce-overhead", "max-autotune-no-cudagraphs")
 OOM_EXIT = 3
 FULL_PROBE_SIZES = (1, 2)
 VARIANT_PROBE_SIZES = (1, 5)
+
+
+def _opts(spec):
+    try:
+        return Optimizations.parse(spec)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
 
 
 def _batch_size(value):
@@ -85,8 +95,9 @@ def parse_args(argv=None):
     p.add_argument("--full-batch-size", type=_batch_size, default="auto",
                    help="sequences per full forward pass, or 'auto': the "
                         "largest that fits in GPU memory")
-    p.add_argument("--variant-batch-size", type=_batch_size, default="auto",
-                   help="substitutions per incremental batch, or 'auto'")
+    p.add_argument("--variant-batch-size", type=_batch_size, default=32,
+                   help="substitutions per incremental batch, or 'auto' "
+                        "(throughput no longer improves past about 32)")
     p.add_argument("--only", choices=WORKLOADS,
                    help="time only this workload (the accuracy checks still "
                         "run both)")
@@ -104,8 +115,36 @@ def parse_args(argv=None):
     )
     p.add_argument("--no-compile", action="store_true")
     p.add_argument(
+        "--compile-mode", choices=COMPILE_MODES, default="default",
+        help="torch.compile mode; reduce-overhead adds CUDA graphs",
+    )
+    p.add_argument("--freezing", action="store_true",
+                   help="Inductor freezing: weights become constants")
+    p.add_argument(
+        "--opts", type=_opts, default=Optimizations(),
+        help="incremental rewrites (spliceai2_ism.incremental.Optimizations): "
+             "'all' (default), 'none', names to enable, or 'all,-name' to "
+             f"leave one out; names: {', '.join(Optimizations.names())}. "
+             "The naive path never uses them",
+    )
+    p.add_argument(
         "--cudnn-benchmark", action="store_true",
         help="enable cuDNN autotuning (left off by the reference)",
+    )
+    p.add_argument(
+        "--e2e-output", choices=["full", "deltas"], default="full",
+        help="end-to-end output: full probability tracks and junction "
+             "matrices, or sparse deltas against the reference computed on "
+             "the GPU, as spliceai2-ism writes them",
+    )
+    p.add_argument("--min-delta", type=float, default=1e-3,
+                   help="with --e2e-output deltas: smallest |Δ probability| "
+                        "kept (spliceai2-ism's default)")
+    p.add_argument(
+        "--host-copy", choices=["pinned", "pageable"], default="pinned",
+        help="with --e2e-output full: copy outputs to the CPU into reused "
+             "pinned buffers, or into newly allocated pageable memory (plain "
+             ".cpu(), as before)",
     )
     p.add_argument("--warm-seconds", type=float, default=0,
                    help="run both workloads untimed for this long before "
@@ -164,7 +203,10 @@ class Stages:
     """Compiled stages: batched full passes (``Ensemble``), and the
     incremental reference pass and variant batches."""
 
-    def __init__(self, inc, ens, compile_):
+    def __init__(self, inc, ens, compile_, mode="default"):
+        # CUDA graphs replay into fixed output buffers: callers mark each
+        # step, and keep what must outlive the next call in their own memory
+        self.cudagraphs = compile_ and mode == "reduce-overhead"
         self.full_1d = lambda x: ens.trunk_1d(x)
         self.full_2d = lambda ftrs, out_ss: ens.head_2d(ftrs, out_ss)
         self.ref_1d = lambda x: inc.reference_1d(x)
@@ -176,10 +218,37 @@ class Stages:
             z, out_ss, pos, z_var
         )
         if compile_:
+            kw = {"dynamic": False}
+            if mode != "default":
+                kw["mode"] = mode
             for name in ("full_1d", "full_2d", "ref_1d", "ref_2d", "var_1d",
                          "var_2d"):
-                setattr(self, name,
-                        torch.compile(getattr(self, name), dynamic=False))
+                setattr(self, name, torch.compile(getattr(self, name), **kw))
+
+    def step(self):
+        """Call before each item: starts a new CUDA-graph step."""
+        if self.cudagraphs:
+            torch.compiler.cudagraph_mark_step_begin()
+
+
+class StaticCopy:
+    """Copies a tree of tensors into buffers allocated on first use and
+    reused afterwards, marked as static inputs, so CUDA graphs read them in
+    place instead of copying them on every replay."""
+
+    def __init__(self):
+        self.bufs = None
+
+    def __call__(self, tree):
+        flat, spec = pytree.tree_flatten(tree)
+        if self.bufs is None:
+            self.bufs = [t.clone() for t in flat]
+            for t in self.bufs:
+                torch._dynamo.mark_static_address(t)
+        else:
+            for dst, src in zip(self.bufs, flat):
+                dst.copy_(src)
+        return pytree.tree_unflatten(self.bufs, spec)
 
 
 def full_batches(n, batch_size):
@@ -205,12 +274,19 @@ class FullWorkload:
         self.inputs = [self._encode(i).pin_memory()
                        for i in range(len(self.batches))]
         self.peak_mem = 0
+        self.host_buffers = {}  # pinned output buffers, see to_host
+        self.ref_out = None  # reference prediction, see remember_reference
 
     def __len__(self):
         return len(self.batches)
 
     def predictions(self, i):
         return self.batches[i][1]
+
+    def reference_rows(self, i):
+        """Rows of item i that hold the reference sequence (sequence 0)."""
+        idx, n = self.batches[i]
+        return [r for r in range(n) if idx[r] == 0]
 
     def _encode(self, i):
         return encode_many([self.seqs[j] for j in self.batches[i][0]])
@@ -221,6 +297,7 @@ class FullWorkload:
 
     def run(self, x, between=None):
         """Returns (out_ss, idxs, out_jxn); ``between`` runs after stage 1D."""
+        self.stages.step()
         with inference():
             with label("1d"):
                 ftrs, out_ss = self.stages.full_1d(x)
@@ -251,13 +328,19 @@ class IncrementalWorkload:
         self.pinned = [tuple(torch.tensor(v).pin_memory() for v in b[:2])
                        for b in self.batches]
         self.cache = self.ref_ss = None
+        self.static = StaticCopy() if stages.cudagraphs else None
         self.peak_mem = 0
+        self.host_buffers = {}  # pinned output buffers, see to_host
+        self.ref_out = None  # reference prediction, see remember_reference
 
     def __len__(self):
         return 1 + len(self.batches)
 
     def predictions(self, i):
         return 1 if i == 0 else self.batches[i - 1][2]
+
+    def reference_rows(self, i):
+        return [0] if i == 0 else []
 
     def load(self, i, from_string=False):
         if i == 0:
@@ -272,12 +355,19 @@ class IncrementalWorkload:
                 alt.to(self.device, non_blocking=True))
 
     def run(self, inp, between=None):
+        self.stages.step()
         with inference():
             if isinstance(inp, torch.Tensor):
-                # free the old cache before building anew
-                self.cache = self.ref_ss = None
+                if self.static is None:
+                    # free the old cache before building anew
+                    self.cache = self.ref_ss = None
                 with label("ref_1d"):
                     self.cache, self.ref_ss = self.stages.ref_1d(inp)
+                    if self.static is not None:
+                        # CUDA graphs: the cache must outlive later replays
+                        self.cache, self.ref_ss = self.static(
+                            (self.cache, self.ref_ss)
+                        )
                 if between is not None:
                     between()
                 out_ss = self.ref_ss
@@ -297,12 +387,72 @@ class IncrementalWorkload:
         return out_ss, idxs, out_jxn
 
 
-def to_host(w, i, out):
-    """CPU probabilities of the real (unpadded) predictions of item i."""
+def to_host(w, i, out, mode="pinned"):
+    """CPU probabilities of the real (unpadded) predictions of item i.
+
+    mode "pageable": plain ``.cpu()``, which allocates new host memory
+    every call. "pinned": copies into page-locked buffers that are
+    allocated once per output shape and reused (``w.host_buffers``), so the
+    returned tensors are overwritten by the next call with the same shape.
+    """
     n = w.predictions(i)
     out_ss, idxs, out_jxn = (t[:n] for t in out)
-    return (out_ss.sigmoid().float().cpu(), idxs.cpu(),
-            out_jxn.sigmoid().float().cpu())
+    probs = (out_ss.sigmoid().float(), idxs, out_jxn.sigmoid().float())
+    if mode == "pageable":
+        return tuple(t.cpu() for t in probs)
+    # keyed on the padded batch shape, so the tail batch (fewer real
+    # predictions) reuses the full-size buffers
+    key = tuple((tuple(t.shape), t.dtype) for t in out)
+    bufs = w.host_buffers.get(key)
+    if bufs is None:
+        bufs = w.host_buffers[key] = tuple(
+            torch.empty((t.shape[0], *p.shape[1:]), dtype=p.dtype,
+                        pin_memory=True)
+            for t, p in zip(out, probs)
+        )
+    host = tuple(b[:n] for b in bufs)
+    for h, p in zip(host, probs):
+        h.copy_(p, non_blocking=True)
+    torch.cuda.current_stream().synchronize()
+    return host
+
+
+def remember_reference(w, i, out):
+    """Keeps the reference prediction (logits) if item i holds it, as the
+    baseline of ``deltas_to_host``. Cloned: under CUDA graphs ``out`` is
+    overwritten by the next replay."""
+    for r in w.reference_rows(i):
+        out_ss, idxs, out_jxn = out
+        w.ref_out = (out_ss[r:r + 1].clone(), idxs[r].clone(),
+                     out_jxn[r].clone())
+
+
+def deltas_to_host(w, i, out, min_delta):
+    """Like spliceai2-ism: sparse deltas of item i's predictions against the
+    reference, computed on the GPU, and only those copied to the CPU; the
+    reference itself as full probabilities (``haplotype_rows``). 1D deltas
+    cover the whole output region (spliceai2-ism only looks inside each
+    SNV's cone, where every non-zero delta lies)."""
+    n = w.predictions(i)
+    out_ss, idxs, out_jxn = (t[:n] for t in out)
+    ref_ss, ref_idx, ref_jxn = w.ref_out
+    host = [tuple(t.cpu() for t in haplotype_rows(
+        out_ss[r:r + 1], idxs[r], out_jxn[r], out_ss.shape[2]))
+        for r in w.reference_rows(i)]
+    d = out_ss.float().sigmoid() - ref_ss.float().sigmoid()
+    keep = (d.abs() >= min_delta).any(dim=1)
+    row, pos = keep.nonzero(as_tuple=True)
+    r1 = (row, pos, d[row, 0, pos], d[row, 1, pos])
+    r2 = delta_2d(ref_idx, ref_jxn, idxs, out_jxn, min_delta)
+    host.append(tuple(t.cpu() for t in (*r1, *r2)))
+    return host
+
+
+def make_emit(args):
+    """The end-to-end output step, ``emit(w, i, out)``."""
+    if args.e2e_output == "deltas":
+        return lambda w, i, out: deltas_to_host(w, i, out, args.min_delta)
+    return lambda w, i, out: to_host(w, i, out, args.host_copy)
 
 
 def probe_peaks(fn, sizes):
@@ -455,17 +605,35 @@ def gpu_pass(workloads, schedule):
     return times
 
 
-def e2e_pass(workloads, schedule):
+E2E_PHASES = ("load", "run", "to_host")
+
+
+def e2e_pass(workloads, schedule, emit):
     """Wall-clock seconds per item: strings (or substitution lists) to CPU
-    probabilities."""
+    probabilities. Returns ({name: [total, ...]}, {name: [(load, run,
+    to_host), ...]}) in item order:
+      load     encode on the CPU, pin, launch the copy to the GPU;
+      run      both stages, until the GPU has finished;
+      to_host  ``emit``: probabilities or sparse deltas, copied to CPU
+               memory (see make_emit).
+    The synchronize that ends ``run`` replaces the one the copy would do
+    anyway, so the total matches an unsplit pass."""
     times = {w.name: [None] * len(w) for w in workloads}
+    phases = {w.name: [None] * len(w) for w in workloads}
     for k, i in schedule:
         w = workloads[k]
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        to_host(w, i, w.run(w.load(i, from_string=True)))
-        times[w.name][i] = time.perf_counter() - t0
-    return times
+        inp = w.load(i, from_string=True)
+        t1 = time.perf_counter()
+        out = w.run(inp)
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        emit(w, i, out)
+        t3 = time.perf_counter()
+        times[w.name][i] = t3 - t0
+        phases[w.name][i] = (t1 - t0, t2 - t1, t3 - t2)
+    return times, phases
 
 
 def compare(ours, theirs):
@@ -518,6 +686,36 @@ def check_against_original(models, inc, args, device):
             "variants": compare(ours[1:], theirs[1:])}
 
 
+def check_against_unoptimized(models, inc, args, device, n_variants=32):
+    """The incremental path with ``inc.opts`` vs the same path without any
+    rewrite (Optimizations.none()), eager under FP16 autocast, on the short
+    check sequence: the rewrites' own effect on the outputs, separate from
+    the incremental scheme's."""
+    base = IncrementalEnsemble(list(inc.models), args.out_2d_len,
+                               Optimizations.none())
+    crop_len = inc.crop_len
+    seq = random_sequences(1, args.check_len + crop_len, args.seed + 4)[0]
+    positions, alts = random_substitutions(seq, crop_len, args.check_len,
+                                           n_variants, args.seed + 5)
+    x = encode(seq).to(device)
+    pos = torch.tensor(positions, device=device)
+    alt = torch.tensor(alts, device=device)
+    outs = []
+    with inference():
+        for e in (inc, base):
+            cache, ref_ss = e.reference_1d(x)
+            idxs, jxn = e.head_2d(cache[1], ref_ss)
+            preds = [(ref_ss[0], idxs[0], jxn[0])]
+            z_var, var_ss = e.variants_track(cache, ref_ss, pos, alt)
+            idxs, jxn = e.head_2d(cache[1], var_ss, pos, z_var)
+            preds += [(var_ss[j], idxs[j], jxn[j]) for j in range(len(pos))]
+            outs.append([tuple(t.cpu() for t in p) for p in preds])
+            del cache, z_var
+            torch.cuda.empty_cache()
+    return {"reference": compare(outs[0][:1], outs[1][:1]),
+            "variants": compare(outs[0][1:], outs[1][1:])}
+
+
 def check_against_full(full, incr):
     """Every variant's incremental prediction vs its full pass (untimed).
     Sequence 0 of the full workload is the reference, sequence 1 + j the
@@ -538,11 +736,17 @@ def check_against_full(full, incr):
     return compare(mine, theirs)
 
 
-def stage_summary(gpu_rounds, e2e_rounds, items, n_predictions):
+def stage_summary(gpu_rounds, e2e_rounds, items, n_predictions,
+                  phase_rounds=()):
     g1 = [sum(rnd[i][0] for i in items) for rnd in gpu_rounds]
     g2 = [sum(rnd[i][1] for i in items) for rnd in gpu_rounds]
     gpu = [a + b for a, b in zip(g1, g2)]
     e2e = [sum(rnd[i] for i in items) for rnd in e2e_rounds]
+    phases = {
+        name: summarize([sum(rnd[i][j] for i in items)
+                         for rnd in phase_rounds])
+        for j, name in enumerate(E2E_PHASES)
+    } if phase_rounds else None
     return {
         "n_predictions": n_predictions,
         "gpu_s": {
@@ -551,6 +755,7 @@ def stage_summary(gpu_rounds, e2e_rounds, items, n_predictions):
             "total": summarize(gpu),
         },
         "end_to_end_s": summarize(e2e),
+        "end_to_end_phases_s": phases,
         "predictions_per_s": {
             "gpu": n_predictions / statistics.median(gpu),
             "e2e": n_predictions / statistics.median(e2e),
@@ -580,11 +785,15 @@ def run(args, chosen):
     device = torch.device("cuda")
     torch.backends.cudnn.benchmark = args.cudnn_benchmark
     compile_ = not args.no_compile
+    if args.freezing:
+        import torch._inductor.config as inductor_config
+        inductor_config.freezing = True
 
     t0 = time.perf_counter()
     model_dir = args.model_dir or download_models()
     models = [load_model(p) for p in checkpoint_paths(model_dir)]
-    inc = IncrementalEnsemble(models, args.out_2d_len).eval().to(device)
+    inc = IncrementalEnsemble(models, args.out_2d_len,
+                              args.opts).eval().to(device)
     ens = Ensemble(list(inc.models), args.out_2d_len).eval()  # same modules
     torch.cuda.synchronize()
     load_s = time.perf_counter() - t0
@@ -605,6 +814,13 @@ def run(args, chosen):
           f"(eager, {args.check_len:,} positions)...", flush=True)
     original_check = check_against_original(models, inc, args, device)
     torch.cuda.empty_cache()
+    unoptimized_check = None
+    if args.opts != Optimizations.none():
+        print(f"Checking the rewrites ({args.opts.spec()}) against the "
+              "unoptimized incremental path (eager)...", flush=True)
+        unoptimized_check = check_against_unoptimized(models, inc, args,
+                                                      device)
+        torch.cuda.empty_cache()
 
     print("Generating sequences...", flush=True)
     seq = random_sequences(1, args.seq_len + m.crop_len, args.seed)[0]
@@ -635,7 +851,8 @@ def run(args, chosen):
     print(f"  {sizing['capacity_bytes'] / 2**30:.1f} GiB available",
           flush=True)
 
-    stages = Stages(inc, ens, compile_)
+    stages = Stages(inc, ens, compile_, args.compile_mode)
+    emit = make_emit(args)
     full = FullWorkload(seqs, chosen["full"], stages, device)
     incr = IncrementalWorkload(seq, positions, alts, chosen["variant"],
                                stages, device)
@@ -651,7 +868,10 @@ def run(args, chosen):
     warmup_s[f"variant batch of {chosen['variant']}"] = warmup(incr, 1)
     for w in (full, incr):
         for i in range(len(w)):
-            w.run(w.load(i))
+            out = w.run(w.load(i))
+            remember_reference(w, i, out)  # item 0 holds it, so it comes first
+            # also allocates the pinned output buffers, outside the timing
+            emit(w, i, out)
     torch.cuda.synchronize()
 
     print("Checking incremental predictions against full passes...",
@@ -675,6 +895,7 @@ def run(args, chosen):
 
     gpu_rounds = {w.name: [] for w in workloads}
     e2e_rounds = {w.name: [] for w in workloads}
+    phase_rounds = {w.name: [] for w in workloads}
     passes = []
     for r in range(args.repeats):
         order = "forward" if r % 2 == 0 else "reverse"
@@ -688,9 +909,11 @@ def run(args, chosen):
                 totals = {n: sum(a + b for a, b in t) for n, t in times.items()}
                 rounds = gpu_rounds
             else:
-                times = e2e_pass(workloads, sched)
+                times, phases = e2e_pass(workloads, sched, emit)
                 totals = {n: sum(t) for n, t in times.items()}
                 rounds = e2e_rounds
+                for name, p in phases.items():
+                    phase_rounds[name].append(p)
             elapsed = time.perf_counter() - t_start
             after = gpu_telemetry()
             for name, t in times.items():
@@ -735,18 +958,19 @@ def run(args, chosen):
     if full in workloads:
         summaries["full"] = {
             **stage_summary(gpu_rounds["full"], e2e_rounds["full"],
-                            range(len(full)), n_pred),
+                            range(len(full)), n_pred, phase_rounds["full"]),
             "batch_size": chosen["full"],
             "batches": len(full),
             "peak_gpu_mem_bytes": full.peak_mem,
         }
     if incr in workloads:
         g, e = gpu_rounds["incremental"], e2e_rounds["incremental"]
+        ph = phase_rounds["incremental"]
         summaries["incremental"] = {
-            "reference": stage_summary(g, e, [0], 1),
+            "reference": stage_summary(g, e, [0], 1, ph),
             "variants": stage_summary(g, e, range(1, len(incr)),
-                                      args.n_mutations),
-            "total": stage_summary(g, e, range(len(incr)), n_pred),
+                                      args.n_mutations, ph),
+            "total": stage_summary(g, e, range(len(incr)), n_pred, ph),
             "batch_size": chosen["variant"],
             "peak_gpu_mem_bytes": incr.peak_mem,
         }
@@ -774,6 +998,12 @@ def run(args, chosen):
             "compile": compile_,
             "autocast": "float16",
             "cudnn_benchmark": args.cudnn_benchmark,
+            "compile_mode": args.compile_mode,
+            "freezing": args.freezing,
+            "opts": args.opts.spec(),
+            "e2e_output": args.e2e_output,
+            "min_delta": args.min_delta,
+            "host_copy": args.host_copy,
             "warm_seconds": args.warm_seconds,
             "repeats": args.repeats,
             "seed": args.seed,
@@ -791,7 +1021,8 @@ def run(args, chosen):
             "recompute_fraction": inc.recompute_fraction(n_in),
             "blocks": [vars(p) for p in inc.plans],
         },
-        "accuracy": {"original_model": original_check, "full_pass": full_check},
+        "accuracy": {"original_model": original_check, "full_pass": full_check,
+                     "vs_unoptimized": unoptimized_check},
         "load_s": load_s,
         "warmup_s": warmup_s,
         "warm": warm,
@@ -836,6 +1067,11 @@ def print_report(r):
               f"  {per(gs['total'], n, what)}")
         print(f"{indent}end-to-end                         "
               f"{fmt(s['end_to_end_s'])}  {per(s['end_to_end_s'], n, what)}")
+        phases = s.get("end_to_end_phases_s")
+        if phases:
+            print(f"{indent}  " + ",  ".join(
+                f"{name} {phases[name]['median']:.3f} s"
+                for name in E2E_PHASES))
         rate = s["predictions_per_s"]
         plural = what + ("es" if what.endswith("s") else "s")
         print(f"{indent}throughput                         "
@@ -856,6 +1092,13 @@ def print_report(r):
           f"torch.compile {'on' if c['compile'] else 'off'}, "
           f"cudnn.benchmark {'on' if c['cudnn_benchmark'] else 'off'}, "
           f"heads 1d,2d, out_2d_len {c['out_2d_len']}")
+    print(f"  compile            mode {c.get('compile_mode', 'default')}, "
+          f"freezing {'on' if c.get('freezing') else 'off'}")
+    print(f"  incremental opts   {c.get('opts', 'none')}")
+    output = c.get("e2e_output", "full")
+    print(f"  end-to-end output  " + (
+        f"sparse deltas (|Δp| ≥ {c.get('min_delta')})" if output == "deltas"
+        else f"full outputs, {c.get('host_copy', 'pageable')} host copies"))
     print(f"  sequence           {c['seq_len']:,} positions "
           f"({c['seq_len'] + c['crop_len']:,} nt input): reference + "
           f"{c['n_mutations']} {c['layout']} substitutions = {n_pred} "
@@ -883,6 +1126,13 @@ def print_report(r):
     print(f"  original model, {c['check_len']:,} positions, eager")
     print(f"    reference pass   {accuracy(a['original_model']['reference'])}")
     print(f"    variants         {accuracy(a['original_model']['variants'])}")
+    if a.get("vs_unoptimized"):
+        print(f"  rewrites vs unoptimized incremental, {c['check_len']:,} "
+              f"positions, eager")
+        print(f"    reference pass   "
+              f"{accuracy(a['vs_unoptimized']['reference'])}")
+        print(f"    variants         "
+              f"{accuracy(a['vs_unoptimized']['variants'])}")
     print(f"  incremental vs full pass, compiled")
     print(f"    all variants     {accuracy(a['full_pass'])}")
     print()

@@ -60,7 +60,10 @@ def parse_args(argv=None):
                    help="interleaved rounds per run (even: balanced)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--cudnn-benchmark", action="store_true")
-    p.add_argument("--profile", action="store_true",
+    p.add_argument("--host-copy", choices=["pinned", "pageable"],
+                   default="pinned",
+                   help="how end-to-end passes copy outputs to the CPU")
+    p.add_argument("--profile",action="store_true",
                    help="torch.profiler traces for every run")
     p.add_argument("--profile-stacks", action="store_true",
                    help="with --profile: also Python stacks and flamegraphs")
@@ -91,7 +94,8 @@ def common_args(args, layout):
            "--layout", layout,
            "--warm-seconds", str(args.warm_seconds),
            "--repeats", str(args.repeats),
-           "--seed", str(args.seed)]
+           "--seed", str(args.seed),
+           "--host-copy", args.host_copy]
     if args.cudnn_benchmark:
         out.append("--cudnn-benchmark")
     if args.model_dir:

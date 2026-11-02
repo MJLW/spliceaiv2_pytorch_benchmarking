@@ -21,6 +21,7 @@ spliceai2-mutbench = "spliceai2_bench.mutation_benchmark:main"
 spliceai2-suite = "spliceai2_bench.suite:main"
 spliceai2-sweep = "spliceai2_bench.sweep:main"
 spliceai2-flamediff = "spliceai2_bench.flamediff:main"
+spliceai2-ablation = "spliceai2_bench.ablation:main"
 
 [dependency-groups]
 dev = ["pytest>=8"]

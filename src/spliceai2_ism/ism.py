@@ -64,8 +64,9 @@ def parse_args(argv=None):
                    help="optional: only these genes (comma-separated) of the "
                         "variant TSV, e.g. to split a run over a job array; "
                         "by default every gene in the variant TSV runs")
-    p.add_argument("--variant-batch-size", type=_batch_size, default="auto",
-                   help="SNVs per incremental batch, or 'auto' (default): "
+    p.add_argument("--variant-batch-size", type=_batch_size, default=32,
+                   help="SNVs per incremental batch (default 32: on an H200, "
+                        "throughput no longer improves past it), or 'auto': "
                         "the largest that fits in GPU memory, measured on "
                         "the longest gene")
     p.add_argument("--out-2d-len", type=int, default=1024,
