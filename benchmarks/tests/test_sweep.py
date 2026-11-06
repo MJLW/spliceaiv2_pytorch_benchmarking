@@ -53,7 +53,7 @@ def test_mutbench_opts_and_compile_flags():
     a = mutbench_args(["--opts", "all,-stencil_resample",
                        "--compile-mode", "reduce-overhead", "--freezing",
                        "--e2e-output", "deltas"])
-    assert not a.opts.stencil_resample and a.opts.fused_junction
+    assert not a.opts.stencil_resample and a.opts.padded_ffn
     assert a.compile_mode == "reduce-overhead" and a.freezing
     assert a.e2e_output == "deltas"
     with pytest.raises(SystemExit):

@@ -183,8 +183,8 @@ def test_padded_ffn_matches_unpadded(width):
 def test_optimizations_parse():
     assert Optimizations.parse("all") == Optimizations()
     assert Optimizations.parse("none") == Optimizations.none()
-    one = Optimizations.parse("fused_junction")
-    assert one.fused_junction and not one.stencil_resample
+    one = Optimizations.parse("padded_ffn")
+    assert one.padded_ffn and not one.stencil_resample
     loo = Optimizations.parse("all,-padded_ffn")
     assert not loo.padded_ffn and loo.stencil_resample
     assert loo.spec() == ",".join(n for n in Optimizations.names()

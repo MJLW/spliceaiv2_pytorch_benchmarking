@@ -138,7 +138,7 @@ Other options:
 
 - `--opts SPEC`: which exact rewrites of the incremental path to use (see
   [Optimizations](../README.md#optimizations)): `all` (default), `none`,
-  names to enable (`stencil_resample,fused_junction`), or `all,-name` to
+  names to enable (`stencil_resample,padded_ffn`), or `all,-name` to
   leave one out. The naive path never uses them.
 - `--compile-mode default|reduce-overhead|max-autotune-no-cudagraphs` and
   `--freezing`: torch.compile settings. Under `reduce-overhead` (CUDA

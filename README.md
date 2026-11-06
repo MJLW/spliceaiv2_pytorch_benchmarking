@@ -263,7 +263,6 @@ opts=Optimizations(...))`, all on by default, `--opts` in
 | `stencil_resample` | linear upsample × p then avg-pool between blocks = 3-tap `[1/8, 3/4, 1/8]` filter (same pool) or stride-2 4-tap `[1/16, 7/16, 7/16, 1/16]` (pool doubles) at pooled resolution; no full-resolution activations | pending (those kernels were ~35% of variant time) |
 | `grouped_head_upsample` | splice-site heads summed per pooling factor (and over both models) before one upsampling: 5 upsamples instead of 40 | pending (~9%) |
 | `reference_depthwise` | reference pass token mixer as fused shifted products instead of PyTorch's generic dilated depthwise kernel | pending (that kernel was 23% of the reference pass) |
-| `fused_junction` | junction logits of all 40 blocks × models as one matmul over concatenated RoPE Q/K, mask applied once | pending (2D stage was ~18%) |
 | `padded_ffn` | FFN of windows with widths not a multiple of 8 (blocks 16-19) run zero-padded, so the 1x1 convolutions get aligned GEMMs instead of `align1` kernels | pending (those GEMMs were ~14%) |
 
 Settings:

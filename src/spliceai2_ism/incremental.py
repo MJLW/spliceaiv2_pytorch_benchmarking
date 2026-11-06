@@ -34,9 +34,6 @@ and all on by default (each can be turned off for ablations):
   * ``reference_depthwise``: the reference pass runs the token mixer as
     shifted products (``_depthwise_same``) instead of PyTorch's generic
     dilated depthwise kernel;
-  * ``fused_junction``: the junction logits of all blocks and models are one
-    matrix product over their concatenated RoPE queries and keys, with the
-    causal mask applied once;
   * ``padded_ffn``: the FFN of windows whose width is not a multiple of 8
     runs on zero-padded columns (dropped afterwards), so the 1x1
     convolutions get aligned GEMM kernels.
@@ -61,7 +58,6 @@ class Optimizations:
     stencil_resample: bool = True
     grouped_head_upsample: bool = True
     reference_depthwise: bool = True
-    fused_junction: bool = True
     padded_ffn: bool = True
 
     @classmethod
@@ -76,7 +72,7 @@ class Optimizations:
     def parse(cls, spec):
         """From a comma-separated spec: ``all``, ``none``, names to enable,
         ``-name`` to disable; it starts from ``none`` unless the first item
-        is ``all``. E.g. ``all,-fused_junction`` or ``stencil_resample``."""
+        is ``all``. E.g. ``all,-padded_ffn`` or ``stencil_resample``."""
         items = [s.strip() for s in spec.split(",") if s.strip()]
         opts = cls() if items[:1] == ["all"] else cls.none()
         for item in items:
@@ -234,29 +230,6 @@ def _resample_full(z, src_pool, pool):
     if halo:
         z = F.pad(z, (halo, halo), mode="replicate")
     return _strided_taps(z, taps, stride, 0, n)
-
-
-def _autocast_dtype(t):
-    device = t.device.type
-    if torch.is_autocast_enabled(device):
-        return torch.get_autocast_dtype(device)
-    return t.dtype
-
-
-def _rope_angles(token_idxs, num_features):
-    """sin and cos of Attention._rope's angles, (B, C / 2, K)."""
-    freqs = 1e4 ** -(
-        torch.arange(0, num_features, 2, device=token_idxs.device)
-        / num_features
-    )
-    angle = token_idxs.unsqueeze(1) * freqs.unsqueeze(1).unsqueeze(0)
-    return angle.sin(), angle.cos()
-
-
-def _rope(x, sin, cos):
-    """Attention._rope with precomputed angles."""
-    x1, x2 = x[:, 0::2], x[:, 1::2]
-    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=1)
 
 
 @dataclass(frozen=True)
@@ -588,8 +561,6 @@ class IncrementalEnsemble(nn.Module):
                                         float("-inf"))
         idxs = scores.topk(self.out_2d_len, dim=1)[1].sort(dim=1).values
         sites = idxs + self.crop_len // 2  # input coordinates
-        if self.opts.fused_junction:
-            return idxs, self._junctions_fused(z, z_var, a, sites, idxs)
         outs = []
         for k, model in enumerate(self.models):
             out = 0.0
@@ -603,37 +574,6 @@ class IncrementalEnsemble(nn.Module):
                 )
             outs.append(out)
         return idxs, torch.stack(outs).mean(dim=0)
-
-    def _junctions_fused(self, z, z_var, a, sites, idxs):
-        """The ensemble mean of every block's Attention output as one matrix
-        product. Each block contributes scale / num_blocks * Q_b^T K_b minus
-        1e4 / num_blocks on and below the diagonal; summed over blocks and
-        averaged over models, that is scale / (num_blocks * models) times
-        the product of the concatenated Q and K, minus 1e4 once."""
-        qs, ks, angles = [], [], None
-        for k, model in enumerate(self.models):
-            for b, plan in enumerate(self.plans):
-                feats = self._features_at(
-                    z[k][b], None if z_var is None else z_var[k][b],
-                    plan, a, sites,
-                )
-                att = model._jxn_heads[b]
-                x = att._token_norm(feats.permute(0, 2, 1)).permute(0, 2, 1)
-                if angles is None:
-                    angles = _rope_angles(idxs, att._num_features)
-                q, kk = (_rope(proj(x), *angles)
-                         for proj in (att._query, att._key))
-                # the matmul would cast to this dtype anyway; casting first
-                # halves the memory of the concatenation under autocast
-                qs.append(q.to(_autocast_dtype(q)))
-                ks.append(kk.to(_autocast_dtype(kk)))
-        num_features = self.models[0]._jxn_heads[0]._num_features
-        scale = num_features ** -0.5 / (self.num_blocks * len(self.models))
-        out = scale * torch.einsum("bcl,bcm->blm", torch.cat(qs, dim=1),
-                                   torch.cat(ks, dim=1))
-        n = out.shape[-1]
-        mask = torch.ones(n, n, dtype=out.dtype, device=out.device).tril()
-        return out - 1e4 * mask
 
     def _features_at(self, zb, zv, plan, a, sites):
         """Block output after linear upsampling, at input positions ``sites``
