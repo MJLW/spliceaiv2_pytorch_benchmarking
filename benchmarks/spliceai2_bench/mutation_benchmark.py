@@ -136,10 +136,11 @@ def parse_args(argv=None):
         help="enable cuDNN autotuning (left off by the reference)",
     )
     p.add_argument(
-        "--e2e-output", choices=["full", "deltas"], default="full",
+        "--e2e-output", choices=["full", "deltas", "none"], default="full",
         help="end-to-end output: full probability tracks and junction "
-             "matrices, or sparse deltas against the reference computed on "
-             "the GPU, as spliceai2-ism writes them",
+             "matrices, sparse deltas against the reference computed on "
+             "the GPU (as spliceai2-ism writes them), or none (outputs stay "
+             "on the GPU; the cost of producing outputs is the difference)",
     )
     p.add_argument("--min-delta", type=float, default=1e-3,
                    help="with --e2e-output deltas: smallest |Δ probability| "
@@ -461,6 +462,8 @@ def make_emit(args):
     """The end-to-end output step, ``emit(w, i, out)``."""
     if args.e2e_output == "deltas":
         return lambda w, i, out: deltas_to_host(w, i, out, args.min_delta)
+    if args.e2e_output == "none":
+        return lambda w, i, out: None
     return lambda w, i, out: to_host(w, i, out, args.host_copy)
 
 
@@ -1119,6 +1122,7 @@ def print_report(r):
     output = c.get("e2e_output", "full")
     print(f"  end-to-end output  " + (
         f"sparse deltas (|Δp| ≥ {c.get('min_delta')})" if output == "deltas"
+        else "none (outputs stay on the GPU)" if output == "none"
         else f"full outputs, {c.get('host_copy', 'pageable')} host copies"))
     print(f"  sequence           {c['seq_len']:,} positions "
           f"({c['seq_len'] + c['crop_len']:,} nt input): reference + "

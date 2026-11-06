@@ -280,10 +280,11 @@ passes per round.
 
 ## spliceai2-ablation: each optimization on and off
 
-Runs `spliceai2-mutbench` once per configuration, each in its own process,
-on one workload: reference + `--n-mutations` (499) `--layout` (random)
-substitutions of `--seq-len` (100,000) positions, variant batch 32, only
-the incremental workload timed.
+Runs `spliceai2-mutbench` once per configuration and sequence length, each
+in its own process: reference + `--n-mutations` (499) `--layout` (random)
+substitutions of a sequence of each of `--seq-lens` (10,000, 20,000, 50,000
+and 100,000 positions, as genes of those lengths), variant batch 32, only
+the incremental workload timed. `--seq-lens N` runs one length.
 
 - `none`, `all`: no rewrite, every rewrite.
 - `only_<name>`, `all_minus_<name>`: each rewrite alone, and every rewrite
@@ -291,14 +292,28 @@ the incremental workload timed.
   second its gain on top of the others (`all` over `all_minus_<name>`).
 - `all_freezing`, `all_reduce_overhead`, `all_max_autotune`: compile
   settings on top of `all`.
-- `all_pageable`, `all_deltas`: end-to-end output variants (plain `.cpu()`
-  copies; sparse deltas as `spliceai2-ism` writes them).
+- `all_pageable`, `all_deltas`, `all_no_output`: end-to-end output
+  variants (plain `.cpu()` copies; sparse deltas as `spliceai2-ism` writes
+  them; no output at all, so end-to-end is only loading and running). The
+  difference between `all_no_output` and the others is the cost of
+  producing outputs. The benchmark never writes files; the cost of writing
+  Parquet in `spliceai2-ism` is not included.
 - `naive`: `all` with the naive full passes timed in the same process,
   for the speedup over plain SpliceAI2.
 
+`trim_windows` only trims SNVs near the ends of the sequence, or on short
+sequences, and a batch takes the widest window any of its SNVs needs. With
+random positions, every batch at 10,000-50,000 positions is trimmed (the
+whole sequence is shorter than the last blocks' windows), but at 100,000
+nearly every batch keeps the full width; in `spliceai2-ism`, where a batch
+holds neighbouring SNVs, SNVs near a gene's ends are trimmed too
+(`--layout consecutive` approaches that). Each width class compiles its own
+variant graphs; their compile time is included.
+
 `--configs a,b,...` runs a subset. `ablation.md` and `ablation.json` (in
-`results/ablation-<timestamp>/` or `--out-dir`) list each rewrite's gain and,
-per run, GPU throughput, ms per variant (2D part), reference pass, end-to-end
+`results/ablation-<timestamp>/` or `--out-dir`; each length's runs in a
+subdirectory such as `10kb/`) list each rewrite's gain per length, side by
+side, and, per run, GPU throughput, ms per variant (2D part), reference pass, end-to-end
 throughput and phases, peak memory, compile time, and accuracy against the
 naive full passes and against the unoptimized incremental path.
 `benchmarks/h200_ablation.sbatch` runs all of it on one H200.
