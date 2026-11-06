@@ -283,10 +283,11 @@ def test_out_of_memory_halves_batch_size(outputs, tmp_path, monkeypatch):
             super().__init__(inc, compile_)
             variants = self.variants
 
-            def guarded(cache, hap_scores, pos, alt, valid_len):
+            def guarded(cache, hap_scores, pos, alt, valid_len, widths=None):
                 if len(pos) > 16:
                     raise torch.cuda.OutOfMemoryError("simulated")
-                return variants(cache, hap_scores, pos, alt, valid_len)
+                return variants(cache, hap_scores, pos, alt, valid_len,
+                                widths)
 
             self.variants = guarded
 

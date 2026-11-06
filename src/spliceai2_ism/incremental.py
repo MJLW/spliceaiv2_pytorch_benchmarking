@@ -36,7 +36,17 @@ and all on by default (each can be turned off for ablations):
     dilated depthwise kernel;
   * ``padded_ffn``: the FFN of windows whose width is not a multiple of 8
     runs on zero-padded columns (dropped afterwards), so the 1x1
-    convolutions get aligned GEMM kernels.
+    convolutions get aligned GEMM kernels;
+  * ``trim_windows``: outputs are only needed in the output region (for
+    genes: the gene body, or the first out_2d_len positions), and block b
+    only needs to be correct where later blocks can still carry it there:
+    the region ± ``margins[b]``. The last blocks' windows (±56 kb for the
+    released models) are wider than that for SNVs near the ends of a gene,
+    or for short genes. ``window_widths`` picks, per batch, the smallest of
+    a few fixed widths (k / TRIM_STEPS of the full window) that covers each
+    SNV's needed part, and each window is shifted per SNV to cover it. One
+    compiled graph per width class; batches of neighbouring SNVs (as in
+    saturation mutagenesis) share one.
 
 Coordinates: full-resolution positions are model-input positions (0..N-1,
 N = L + crop_len). A substitution at input position p is handled relative to
@@ -46,6 +56,7 @@ resolution and its shape does not depend on p.
 """
 from dataclasses import dataclass, fields, replace
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -59,6 +70,7 @@ class Optimizations:
     grouped_head_upsample: bool = True
     reference_depthwise: bool = True
     padded_ffn: bool = True
+    trim_windows: bool = True
 
     @classmethod
     def names(cls):
@@ -290,6 +302,35 @@ def plan_blocks(model):
     return plans, changed
 
 
+def plan_margins(plans, align):
+    """Per block, how far beyond the output region (full-resolution
+    positions, a multiple of ``align``) its output must be correct for every
+    output in the region to be: its own splice-site head and the junction
+    features read one bin per side (linear upsampling); the next block
+    reads its input bins (which round outwards to whole bins) ± its
+    token-mixer radius, each from one more source bin per side."""
+    margins = [0] * len(plans)
+    for b in reversed(range(len(plans))):
+        need = plans[b].pool
+        if b + 1 < len(plans):
+            nxt = plans[b + 1]
+            need = max(need, margins[b + 1] + (nxt.radius + 1) * nxt.pool
+                       + plans[b].pool)
+        margins[b] = _ceil_to(need, align)
+    return margins
+
+
+def _overlay(ref, idx, var, var_start):
+    """``ref`` (B, C, W) at positions ``idx`` (B, W), with ``var`` (B, C, w)
+    covering positions ``var_start`` (B,) .. + w written over it."""
+    w = var.shape[2]
+    rel = idx - var_start.unsqueeze(1)
+    inside = (rel >= 0) & (rel < w)
+    v = var.gather(2, rel.clamp(0, w - 1).unsqueeze(1)
+                   .expand(-1, var.shape[1], -1))
+    return torch.where(inside.unsqueeze(1), v, ref)
+
+
 class IncrementalEnsemble(nn.Module):
     """Two-model ensemble that scores substitutions against a cached reference.
 
@@ -340,6 +381,86 @@ class IncrementalEnsemble(nn.Module):
         self.pool_groups = {}
         for b, plan in enumerate(self.plans):
             self.pool_groups.setdefault(plan.pool, []).append(b)
+        # trim_windows: blocks whose window can reach past where they must
+        # be correct (block 0 never does; it reads the one-hot input)
+        self.margins = plan_margins(self.plans, self.align)
+        self.trim_blocks = tuple(
+            b for b, plan in enumerate(self.plans)
+            if b > 0 and -plan.out_start * plan.pool > self.margins[b]
+        )
+
+    TRIM_STEPS = 8  # trim_windows: widths are k / TRIM_STEPS of the full one
+
+    @property
+    def max_width_classes(self):
+        """Compiled variant graphs per output length and batch size, at
+        most: one per combination of trimmed widths, plus the full one."""
+        if not self.opts.trim_windows:
+            return 1
+        return self.TRIM_STEPS ** len(self.trim_blocks)
+
+    def window_widths(self, pos, region_len):
+        """Width class of a batch of SNVs at output positions ``pos``
+        (sequence of ints; host side), for outputs that must be exact on
+        output positions [0, ``region_len``): the pooled width of each
+        trimmable block's window, or None if every window keeps its full
+        width (then nothing is trimmed). Pass the result to
+        ``variants_1d`` / ``variants_track`` and ``head_2d``.
+
+        Per block, the SNV's window [v0, v0 + out_width) only matters where
+        it meets the bins the block must be correct on, [n0, n1); the class
+        is the smallest k / TRIM_STEPS of the full width that covers this
+        for every SNV of the batch.
+
+        The region is at least ``out_2d_len`` long: the junction head
+        always takes that many candidate sites, so ``head_2d``'s
+        ``valid_len`` must be at least as long too (``spliceai2-ism`` uses
+        max(gene length, out_2d_len))."""
+        if not self.opts.trim_windows or not self.trim_blocks:
+            return None
+        region_len = max(region_len, self.out_2d_len)
+        if isinstance(pos, torch.Tensor):
+            pos = pos.cpu().numpy()
+        half = self.crop_len // 2
+        a = (np.asarray(pos, dtype=np.int64) + half) // self.align * self.align
+        widths = []
+        for b in self.trim_blocks:
+            plan, m = self.plans[b], self.margins[b]
+            v0 = a // plan.pool + plan.out_start
+            v1 = v0 + plan.out_width
+            n0 = (half - m) // plan.pool
+            n1 = -(-(half + region_len + m) // plan.pool)
+            need = max(1, int((np.minimum(v1, n1) - np.maximum(v0, n0)).max()))
+            widths.append(next(
+                w for k in range(1, self.TRIM_STEPS + 1)
+                if (w := -(-k * plan.out_width // self.TRIM_STEPS)) >= need
+            ))
+        if all(w == self.plans[b].out_width
+               for b, w in zip(self.trim_blocks, widths)):
+            return None
+        return tuple(widths)
+
+    def _geometry(self, a, widths):
+        """Per block: each SNV's recomputed output window as (start (B,),
+        width), in pooled positions of the input, and whether it is trimmed.
+        A trimmed window starts where its needed part does (but no earlier
+        than the full window), shifted back if it would end past the full
+        window's end; it so stays inside the full window and covers the
+        needed part whenever ``window_widths`` chose its width."""
+        trimmed = dict(zip(self.trim_blocks, widths or ()))
+        half = self.crop_len // 2
+        geo = []
+        for b, plan in enumerate(self.plans):
+            v0 = a // plan.pool + plan.out_start
+            width = trimmed.get(b, plan.out_width)
+            if width == plan.out_width:
+                geo.append((v0, width, False))
+                continue
+            n0 = (half - self.margins[b]) // plan.pool
+            start = torch.minimum(v0.clamp(min=n0),
+                                  v0 + (plan.out_width - width))
+            geo.append((start, width, True))
+        return geo
 
     @property
     def _pad_to(self):
@@ -400,17 +521,20 @@ class IncrementalEnsemble(nn.Module):
             h.append(hs)
         return (onehot, z, h), self._stitch_1d(h, x.shape[2])
 
-    def variants_1d(self, cache, pos, alt):
+    def variants_1d(self, cache, pos, alt, widths=None):
         """B independent substitutions at output positions ``pos`` (B,),
         new bases ``alt`` (B,) (0-3 = A, C, G, T).
 
         Returns each block's recomputed pooled outputs (for ``head_2d``) and
         the splice-site logits (B, 2, window_width) over each variant's cone,
         starting at output position ``window_offsets(pos)``. Outside the cone
-        the variant's logits equal the reference's.
+        the variant's logits equal the reference's. With ``widths`` (from
+        ``window_widths``), the logits are only exact inside the output
+        region that was passed there.
         """
         onehot, z, h = cache
         a, col = self.anchors(pos)
+        geo = self._geometry(a, widths)
         first = self.plans[0]
         # gathers come out (C, B, W); convolutions get contiguous (B, C, W)
         x = onehot[:, self._window(a, 1, first.src_start + self.margin,
@@ -425,6 +549,14 @@ class IncrementalEnsemble(nn.Module):
             zv, hv = [], []
             xb = model._downsamplers[0](model._embed(x))
             for b, plan in enumerate(self.plans):
+                if b > 0 and (geo[b][2] or geo[b - 1][2]):
+                    xb = self._input_trimmed(model, b, z[k][b - 1], zv[-1],
+                                             geo[b - 1][0], *geo[b][:2])
+                    zb = _block_window(model._blocks[b], xb, plan.radius,
+                                       geo[b][1], self._pad_to)
+                    zv.append(zb)
+                    hv.append(model._ss_heads[b](zb))
+                    continue
                 if b > 0:
                     # previous output: reference with the variant slice in it
                     prev = self.plans[b - 1]
@@ -453,11 +585,32 @@ class IncrementalEnsemble(nn.Module):
                 hv.append(model._ss_heads[b](zb))
             z_var.append(zv)
             h_var.append(hv)
-        return z_var, self._stitch_window(h, a, h_var)
+        return z_var, self._stitch_window(h, a, h_var, geo)
 
-    def variants_track(self, cache, ref_ss, pos, alt):
+    def _input_trimmed(self, model, b, z_prev, zv_prev, prev_start, start,
+                       width):
+        """Block b's pooled input over [start - radius, start + width +
+        radius) (start (B,)), for windows that do not sit at the fixed
+        offsets of the untrimmed layout: gathered from the previous block's
+        reference output with its recomputed window (at ``prev_start``)
+        written over it, one extra source bin per side, then resampled."""
+        plan = self.plans[b]
+        r, src = plan.radius, plan.src_pool
+        stride = plan.pool // src
+        n = width + 2 * r
+        idx = ((start - r) * stride - 1).unsqueeze(1) + torch.arange(
+            n * stride + 2, device=start.device
+        )
+        ref = z_prev[:, idx + self.margin // src].permute(1, 0, 2)
+        ctx = _overlay(ref, idx, zv_prev, prev_start).contiguous()
+        if self.opts.stencil_resample:
+            return _resample_window(ctx, src, plan.pool, n)
+        u = model._upsamplers[b - 1](ctx)[..., src:src + n * plan.pool]
+        return model._downsamplers[b](u.contiguous())
+
+    def variants_track(self, cache, ref_ss, pos, alt, widths=None):
         """``variants_1d`` with full-length (B, 2, L) splice-site tracks."""
-        z_var, win = self.variants_1d(cache, pos, alt)
+        z_var, win = self.variants_1d(cache, pos, alt, widths)
         return z_var, self.patch_track(ref_ss, pos, win)
 
     def patch_track(self, track, pos, win):
@@ -491,7 +644,7 @@ class IncrementalEnsemble(nn.Module):
             outs.append(out)
         return torch.stack(outs).mean(dim=0)
 
-    def _stitch_window(self, h, a, h_var):
+    def _stitch_window(self, h, a, h_var, geo):
         """Like ``_stitch_1d``, on each variant's cone only: the reference
         heads with the variant's slices in them, gathered with one extra bin
         per side for the interpolation, upsampled and cropped."""
@@ -504,6 +657,9 @@ class IncrementalEnsemble(nn.Module):
             ctx = h[k][b][:, self._window(
                 a, pool, start + self.margin // pool, width // pool + 2,
             )].permute(1, 0, 2)
+            if geo[b][2]:  # trimmed: written in at its own start
+                idx = self._window(a, pool, start, width // pool + 2)
+                return _overlay(ctx, idx, h_var[k][b], geo[b][0])
             s = plan.out_start - start
             return torch.cat(
                 [ctx[..., :s], h_var[k][b], ctx[..., s + plan.out_width:]],
@@ -544,16 +700,20 @@ class IncrementalEnsemble(nn.Module):
             out = up if out is None else out + up
         return (scale * out).to(dtype)
 
-    def head_2d(self, z, out_ss, pos=None, z_var=None, valid_len=None):
+    def head_2d(self, z, out_ss, pos=None, z_var=None, valid_len=None,
+                widths=None):
         """Top-k candidate sites and junction logits, as ``Ensemble.head_2d``.
 
-        Reference: ``head_2d(z, out_ss)``; variants: also pass the ``pos`` and
-        ``z_var`` used for (and returned by) ``variants_1d``, and their full
-        tracks (``patch_track``; only the max over channels is used, so a
-        (B, 1, L) track of maxima works too). Output positions at or past
-        ``valid_len`` (tensor, 1 or B values) are never candidate sites.
+        Reference: ``head_2d(z, out_ss)``; variants: also pass the ``pos``,
+        ``widths`` and ``z_var`` used for (and returned by) ``variants_1d``,
+        and their full tracks (``patch_track``; only the max over channels is
+        used, so a (B, 1, L) track of maxima works too). Output positions at
+        or past ``valid_len`` (tensor, 1 or B values) are never candidate
+        sites; with ``widths``, ``valid_len`` must not exceed the region
+        they were chosen for.
         """
         a = None if pos is None else self.anchors(pos)[0]
+        geo = None if pos is None else self._geometry(a, widths)
         scores = out_ss.amax(dim=1)
         if valid_len is not None:
             p = torch.arange(scores.shape[1], device=scores.device)
@@ -567,7 +727,7 @@ class IncrementalEnsemble(nn.Module):
             for b, plan in enumerate(self.plans):
                 feats = self._features_at(
                     z[k][b], None if z_var is None else z_var[k][b],
-                    plan, a, sites,
+                    plan, None if geo is None else geo[b][0], sites,
                 )
                 out = out + (1 / self.num_blocks) * model._jxn_heads[b](
                     feats, idxs
@@ -575,9 +735,11 @@ class IncrementalEnsemble(nn.Module):
             outs.append(out)
         return idxs, torch.stack(outs).mean(dim=0)
 
-    def _features_at(self, zb, zv, plan, a, sites):
+    def _features_at(self, zb, zv, plan, start, sites):
         """Block output after linear upsampling, at input positions ``sites``
-        (B, K); computed like nn.Upsample(mode="linear")."""
+        (B, K); computed like nn.Upsample(mode="linear"). ``zv``: the
+        variants' recomputed outputs, starting at pooled position ``start``
+        (B,)."""
         pad = self.margin // plan.pool
         n = zb.shape[1] - 2 * pad
         src = ((sites.float() + 0.5) * (1.0 / plan.pool) - 0.5).clamp(min=0)
@@ -589,9 +751,10 @@ class IncrementalEnsemble(nn.Module):
             ref = zb[:, i + pad].permute(1, 0, 2)
             if zv is None:
                 return ref
-            rel = i - (a // plan.pool + plan.out_start).unsqueeze(1)
-            inside = (rel >= 0) & (rel < plan.out_width)
-            var = zv.gather(2, rel.clamp(0, plan.out_width - 1)
+            w = zv.shape[2]
+            rel = i - start.unsqueeze(1)
+            inside = (rel >= 0) & (rel < w)
+            var = zv.gather(2, rel.clamp(0, w - 1)
                             .unsqueeze(1).expand(-1, zv.shape[1], -1))
             return torch.where(inside.unsqueeze(1), var, ref)
 

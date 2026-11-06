@@ -218,7 +218,8 @@ acceptor.
   gene's 3' end. Only junctions with both sites in the gene are reported.
 - A 100 kb gene has about 300,000 SNVs per haplotype. Throughput is logged
   per haplotype (SNVs/s); the first haplotype of each length bucket also
-  pays for `torch.compile`.
+  pays for `torch.compile`, once per window width class (`trim_windows`:
+  one for genes up to about 20 kb, about 3 at 50 kb and 6 at 100 kb).
 
 ## How it works
 
@@ -239,6 +240,10 @@ acceptor.
   - Each block's input window carries one token-mixer radius of context per
     side; only the outputs that can change are computed from it, so the FFN
     never runs on that context.
+- **Output region:** only outputs in the gene body (or the first
+  `--out-2d-len` positions) are used, so the last blocks' windows are cut
+  to what can still reach it (`trim_windows`, see
+  [Optimizations](#optimizations)); outside it an SNV's track is not exact.
 - **Top-k per SNV:** the junction head picks each SNV's own top-k sites from
   its full splice-site track, as a full pass would.
 
@@ -268,6 +273,7 @@ opts=Optimizations(...))`, all on by default, `--opts` in
 | `reference_depthwise` | reference pass token mixer as fused shifted products instead of PyTorch's generic dilated depthwise kernel | none per variant (it only changes the reference pass); reference pass 1.27× / 1.35× (38.9 → 30.6 ms alone, 34.0 → 25.1 ms on top) |
 | `padded_ffn` | FFN of windows with widths not a multiple of 8 (blocks 16-19) run zero-padded, so the 1x1 convolutions get aligned GEMMs instead of `align1` kernels | 1.16× / 1.34× |
 | all rewrites | | 2.72× (2.55 → 0.935 ms/variant, 1,017 pred/s), ~40× vs naive |
+| `trim_windows` (added after job 16049223) | the last blocks' windows only where later blocks can still reach the output region (gene body, or the first `--out-2d-len` positions): a block must be correct on the region ± the reach of the blocks after it (0 nt for block 19, 16 kb for block 18, ≥33 kb before), so only blocks 18-19 shrink: on genes shorter than the window, or for SNVs near a gene end (within about 42 kb for a 100 kb gene). Per batch, the narrowest of 8 width classes (k/8 of the full window) that covers it; one compiled graph per class | pending; estimated from the window geometry: block work 0.66× for genes ≤ 10 kb, 0.72× at 20 kb, 0.83× at 50 kb, 0.93× at 100 kb (nothing is trimmed for SNVs in the middle 15 kb of a 100 kb gene), so about 1.2× / 1.15× / 1.1× / 1.04× per SNV if block work is half of it |
 
 Each rewrite gains more on top of the others than alone, because the
 others shrink the rest of the variant time. Against the unoptimized

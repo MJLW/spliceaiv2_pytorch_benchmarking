@@ -46,7 +46,11 @@ from spliceai2_ism.deltas import delta_2d, haplotype_rows
 from spliceai2_ism.encode import one_hot_encode, random_sequences
 from spliceai2_ism.incremental import IncrementalEnsemble, Optimizations
 from spliceai2_ism.predict import Ensemble, predict_full
-from spliceai2_ism.runtime import environment_info, forbid_eager_fallback
+from spliceai2_ism.runtime import (
+    environment_info,
+    forbid_eager_fallback,
+    raise_recompile_limit,
+)
 from spliceai2_ism.weights import checkpoint_paths, download_models, load_model
 
 BASES = "ACGT"
@@ -211,11 +215,12 @@ class Stages:
         self.full_2d = lambda ftrs, out_ss: ens.head_2d(ftrs, out_ss)
         self.ref_1d = lambda x: inc.reference_1d(x)
         self.ref_2d = lambda z, out_ss: inc.head_2d(z, out_ss)
-        self.var_1d = lambda cache, ref_ss, pos, alt: inc.variants_track(
-            cache, ref_ss, pos, alt
-        )
-        self.var_2d = lambda z, out_ss, pos, z_var: inc.head_2d(
-            z, out_ss, pos, z_var
+        # widths: the batch's window width class (trim_windows), a
+        # compile-time constant
+        self.var_1d = lambda cache, ref_ss, pos, alt, widths=None: \
+            inc.variants_track(cache, ref_ss, pos, alt, widths)
+        self.var_2d = lambda z, out_ss, pos, z_var, widths=None: inc.head_2d(
+            z, out_ss, pos, z_var, widths=widths
         )
         if compile_:
             kw = {"dynamic": False}
@@ -315,7 +320,10 @@ class IncrementalWorkload:
 
     name = "incremental"
 
-    def __init__(self, ref_seq, positions, alts, batch_size, stages, device):
+    def __init__(self, ref_seq, positions, alts, batch_size, stages, device,
+                 widths=lambda pos: None):
+        """``widths(pos)``: the window width class of a batch (e.g.
+        ``inc.window_widths(pos, seq_len)``), chosen once per batch."""
         self.ref_seq, self.stages, self.device = ref_seq, stages, device
         self.ref_input = encode(ref_seq).pin_memory()
         self.batches = []
@@ -325,6 +333,7 @@ class IncrementalWorkload:
             self.batches.append(
                 (pos + pos[-1:] * pad, alt + alt[-1:] * pad, len(pos))
             )
+        self.widths = [widths(b[0]) for b in self.batches]
         self.pinned = [tuple(torch.tensor(v).pin_memory() for v in b[:2])
                        for b in self.batches]
         self.cache = self.ref_ss = None
@@ -352,7 +361,7 @@ class IncrementalWorkload:
         else:
             pos, alt = self.pinned[i - 1]
         return (pos.to(self.device, non_blocking=True),
-                alt.to(self.device, non_blocking=True))
+                alt.to(self.device, non_blocking=True), self.widths[i - 1])
 
     def run(self, inp, between=None):
         self.stages.step()
@@ -374,15 +383,15 @@ class IncrementalWorkload:
                 with label("ref_2d"):
                     idxs, out_jxn = self.stages.ref_2d(self.cache[1], out_ss)
             else:
-                pos, alt = inp
+                pos, alt, widths = inp
                 with label("var_1d"):
                     z_var, out_ss = self.stages.var_1d(self.cache, self.ref_ss,
-                                                       pos, alt)
+                                                       pos, alt, widths)
                 if between is not None:
                     between()
                 with label("var_2d"):
                     idxs, out_jxn = self.stages.var_2d(
-                        self.cache[1], out_ss, pos, z_var
+                        self.cache[1], out_ss, pos, z_var, widths
                     )
         return out_ss, idxs, out_jxn
 
@@ -670,8 +679,9 @@ def check_against_original(models, inc, args, device):
         cache, ref_ss = inc.reference_1d(encode(seq).to(device))
         idxs, jxn = inc.head_2d(cache[1], ref_ss)
         ours = [(ref_ss[0], idxs[0], jxn[0])]
-        z_var, var_ss = inc.variants_track(cache, ref_ss, pos, alt)
-        idxs, jxn = inc.head_2d(cache[1], var_ss, pos, z_var)
+        widths = inc.window_widths(positions, args.check_len)
+        z_var, var_ss = inc.variants_track(cache, ref_ss, pos, alt, widths)
+        idxs, jxn = inc.head_2d(cache[1], var_ss, pos, z_var, widths=widths)
         ours += [(var_ss[j], idxs[j], jxn[j]) for j in range(len(positions))]
         del cache, z_var
         torch.cuda.empty_cache()
@@ -706,8 +716,10 @@ def check_against_unoptimized(models, inc, args, device, n_variants=32):
             cache, ref_ss = e.reference_1d(x)
             idxs, jxn = e.head_2d(cache[1], ref_ss)
             preds = [(ref_ss[0], idxs[0], jxn[0])]
-            z_var, var_ss = e.variants_track(cache, ref_ss, pos, alt)
-            idxs, jxn = e.head_2d(cache[1], var_ss, pos, z_var)
+            widths = e.window_widths(positions, args.check_len)
+            z_var, var_ss = e.variants_track(cache, ref_ss, pos, alt, widths)
+            idxs, jxn = e.head_2d(cache[1], var_ss, pos, z_var,
+                                  widths=widths)
             preds += [(var_ss[j], idxs[j], jxn[j]) for j in range(len(pos))]
             outs.append([tuple(t.cpu() for t in p) for p in preds])
             del cache, z_var
@@ -854,18 +866,27 @@ def run(args, chosen):
     stages = Stages(inc, ens, compile_, args.compile_mode)
     emit = make_emit(args)
     full = FullWorkload(seqs, chosen["full"], stages, device)
-    incr = IncrementalWorkload(seq, positions, alts, chosen["variant"],
-                               stages, device)
+    incr = IncrementalWorkload(
+        seq, positions, alts, chosen["variant"], stages, device,
+        widths=lambda pos: inc.window_widths(pos, args.seq_len),
+    )
     workloads = [w for w in (full, incr)
                  if args.only is None or w.name == args.only]
 
+    # one variant graph per window width class (trim_windows)
+    classes = list(dict.fromkeys(incr.widths))
     if compile_:
+        raise_recompile_limit(len(classes))
         forbid_eager_fallback()
 
     print("Compiling / warming up...", flush=True)
     warmup_s = {f"full batch of {chosen['full']}": warmup(full, 0),
                 "reference pass": warmup(incr, 0)}  # builds the cache
     warmup_s[f"variant batch of {chosen['variant']}"] = warmup(incr, 1)
+    for widths in classes[1:]:  # first batch of every other width class
+        i = 1 + incr.widths.index(widths)
+        warmup_s[f"variant batch of {chosen['variant']}, widths {widths}"] = \
+            warmup(incr, i)
     for w in (full, incr):
         for i in range(len(w)):
             out = w.run(w.load(i))

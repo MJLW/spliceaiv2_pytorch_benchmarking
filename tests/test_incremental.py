@@ -221,6 +221,110 @@ def test_variant_window_covers_every_change():
         )
 
 
+def _trimmed_vs_untrimmed(models, opts, x, out_len, region_len, batch,
+                          crop_len):
+    """Every position of [0, region_len) in batches of ``batch`` neighbours:
+    with trimmed windows vs without, on the region (float64). Returns the
+    width classes seen."""
+    inc = IncrementalEnsemble(models, OUT_2D_LEN, opts).eval()
+    # as in spliceai2-ism: at least out_2d_len positions are candidate sites
+    valid = torch.tensor([max(region_len, OUT_2D_LEN)])
+    seen = set()
+    with torch.inference_mode():
+        cache, ref_ss = inc.reference_1d(x)
+        for s in range(0, region_len, batch):
+            pos = torch.arange(s, min(s + batch, region_len))
+            alt = (x[0, :4, crop_len // 2 + pos].argmax(dim=0) + 1
+                   + pos % 3) % 4
+            widths = inc.window_widths(pos, region_len)
+            seen.add(widths)
+            outs = []
+            for w in (None, widths):
+                z_var, ss = inc.variants_track(cache, ref_ss, pos, alt, w)
+                outs.append((ss[..., :region_len], *inc.head_2d(
+                    cache[1], ss, pos, z_var, valid_len=valid, widths=w)))
+            (ss0, i0, j0), (ss1, i1, j1) = outs
+            torch.testing.assert_close(ss1, ss0, rtol=1e-10, atol=1e-10)
+            assert torch.equal(i1, i0)
+            torch.testing.assert_close(j1, j0, rtol=1e-10, atol=1e-10)
+    return seen
+
+
+@pytest.mark.parametrize("opts", [
+    Optimizations(), Optimizations.parse("trim_windows"),
+], ids=["all", "trim_windows"])
+@pytest.mark.parametrize("region_len,batch", [
+    (OUT_LEN, 4), (40, 3), (10, 5), (OUT_2D_LEN, 1),
+])
+def test_trimmed_windows_match_untrimmed_on_region(opts, region_len, batch):
+    # float64: trimming is exact, so on the output region the two paths may
+    # only differ by rounding; outside it the trimmed outputs are not used
+    models = [m.double() for m in small_models()]
+    seen = _trimmed_vs_untrimmed(models, opts, reference_input().double(),
+                                 OUT_LEN, region_len, batch, CROP_LEN)
+    assert any(w is not None for w in seen)  # trimming was exercised
+
+
+@pytest.mark.parametrize("opts", [
+    Optimizations(), Optimizations.parse("trim_windows"),
+], ids=["all", "trim_windows"])
+def test_trimmed_windows_deeper_model(opts):
+    # pooling 2 -> 4 at the trimmed blocks' inputs: the stride-2 stencil
+    models = [m.double() for m in small_models(num_blocks=DEEP_BLOCKS,
+                                               crop_len=DEEP_CROP_LEN)]
+    x = reference_input(64, DEEP_CROP_LEN).double()
+    seen = _trimmed_vs_untrimmed(models, opts, x, 64, 64, 8, DEEP_CROP_LEN)
+    assert any(w is not None for w in seen)
+
+
+def test_trimmed_windows_match_full_forward():
+    # ground truth: full passes of each variant sequence, on the region
+    models = small_models()
+    region_len = 40
+    ens = Ensemble(models, OUT_2D_LEN).eval()
+    inc = IncrementalEnsemble(models, OUT_2D_LEN).eval()
+    x = reference_input()
+    valid = torch.tensor([region_len])
+    with torch.inference_mode():
+        cache, ref_ss = inc.reference_1d(x)
+        for positions in ([0, 1, 2], [18, 19, 20], [37, 38, 39]):
+            pos = torch.tensor(positions)
+            alt = (x[0, :4, CROP_LEN // 2 + pos].argmax(dim=0) + 1) % 4
+            widths = inc.window_widths(pos, region_len)
+            assert widths is not None
+            z_var, ss = inc.variants_track(cache, ref_ss, pos, alt, widths)
+            idxs, jxn = inc.head_2d(cache[1], ss, pos, z_var,
+                                    valid_len=valid, widths=widths)
+            for j in range(len(pos)):
+                ftrs, ens_ss = ens.trunk_1d(substitute(x, pos[j], alt[j]))
+                ens_idxs, ens_jxn = ens.head_2d(ftrs, ens_ss, valid)
+                torch.testing.assert_close(ss[j, :, :region_len],
+                                           ens_ss[0, :, :region_len])
+                torch.testing.assert_close(idxs[j], ens_idxs[0])
+                torch.testing.assert_close(jxn[j], ens_jxn[0])
+
+
+def test_window_widths():
+    inc = IncrementalEnsemble(small_models(), OUT_2D_LEN).eval()
+    full = [inc.plans[b].out_width for b in inc.trim_blocks]
+    assert inc.trim_blocks
+    for region_len in (OUT_LEN, 40, 10):
+        for p in range(region_len):
+            w = inc.window_widths([p], region_len)
+            if w is None:
+                continue
+            for wb, fb in zip(w, full):
+                # one of the k / TRIM_STEPS classes
+                assert any(wb == -(-k * fb // inc.TRIM_STEPS)
+                           for k in range(1, inc.TRIM_STEPS + 1))
+    # nothing to trim without the optimization
+    off = IncrementalEnsemble(small_models(), OUT_2D_LEN,
+                              Optimizations.parse("all,-trim_windows"))
+    assert off.window_widths([0], 10) is None
+    assert off.max_width_classes == 1
+    assert inc.max_width_classes == inc.TRIM_STEPS ** len(inc.trim_blocks)
+
+
 def test_head_2d_ignores_positions_past_valid_len():
     inc = IncrementalEnsemble(small_models(), OUT_2D_LEN).eval()
     with torch.inference_mode():

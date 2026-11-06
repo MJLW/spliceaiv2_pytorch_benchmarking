@@ -103,12 +103,14 @@ class Stages:
             idxs, jxn = inc.head_2d(cache[1], hap_ss, valid_len=valid_len)
             return cache, hap_ss, idxs, jxn
 
-        def variants(cache, hap_scores, pos, alt, valid_len):
-            z_var, win = inc.variants_1d(cache, pos, alt)
+        def variants(cache, hap_scores, pos, alt, valid_len, widths=None):
+            # widths: inc.window_widths(pos, valid length), a compile-time
+            # constant (one graph per width class)
+            z_var, win = inc.variants_1d(cache, pos, alt, widths)
             scores = inc.patch_track(hap_scores, pos,
                                      win.amax(dim=1, keepdim=True))
             idxs, jxn = inc.head_2d(cache[1], scores, pos, z_var,
-                                    valid_len=valid_len)
+                                    valid_len=valid_len, widths=widths)
             return win, idxs, jxn
 
         self.reference, self.variants = reference, variants
@@ -131,8 +133,8 @@ def run_haplotype(inc, stages, region, hap, writer, device, batch_size,
     # candidate sites: the gene body, or for genes shorter than out_2d_len
     # the first out_2d_len output positions (the rest is sequence after the
     # gene; junctions there are not reported)
-    valid_len = torch.tensor([max(window.gene_len, inc.out_2d_len)],
-                             device=device)
+    n_valid = max(window.gene_len, inc.out_2d_len)
+    valid_len = torch.tensor([n_valid], device=device)
 
     with inference(device):
         cache, hap_ss, hap_idx, hap_jxn = stages.reference(x, valid_len)
@@ -147,7 +149,8 @@ def run_haplotype(inc, stages, region, hap, writer, device, batch_size,
     half = inc.crop_len // 2
     snv_ref = codes_t[half + snv_pos]
     n_snvs, t_log = len(snv_pos), time.perf_counter()
-    hap_state = (cache, hap_ss, hap_scores, hap_idx, hap_jxn, valid_len)
+    hap_state = (cache, hap_ss, hap_scores, hap_idx, hap_jxn, valid_len,
+                 n_valid)
     s = 0
     while s < n_snvs:
         pos, alt = snv_pos[s:s + batch_size], snv_alt[s:s + batch_size]
@@ -199,12 +202,14 @@ def run_haplotype(inc, stages, region, hap, writer, device, batch_size,
 def _score_batch(inc, stages, hap_state, gene_len, pos, alt, device,
                  min_delta):
     """One SNV batch: sparse 1D and 2D deltas as numpy arrays."""
-    cache, hap_ss, hap_scores, hap_idx, hap_jxn, valid_len = hap_state
+    cache, hap_ss, hap_scores, hap_idx, hap_jxn, valid_len, n_valid = \
+        hap_state
+    widths = inc.window_widths(pos, n_valid)
     pos_t = torch.from_numpy(pos).to(device)
     alt_t = torch.from_numpy(alt).to(device)
     with inference(device):
         win, v_idx, v_jxn = stages.variants(cache, hap_scores, pos_t, alt_t,
-                                            valid_len)
+                                            valid_len, widths)
         r1 = delta_1d(inc, hap_ss, pos_t, win, gene_len, min_delta)
         r2 = delta_2d(hap_idx, hap_jxn, v_idx, v_jxn, min_delta,
                       gene_len=gene_len)
@@ -236,9 +241,11 @@ def run_ism(inc, regions, haplotypes, writer, device, *, compile_=True,
     every later batch."""
     stages = Stages(inc, compile_)
     if compile_:
-        # one graph per output length, and per batch size after halvings
+        # one graph per output length, per batch size after halvings, and
+        # per window width class (trim_windows)
         n_lens = len(set().union(*(r.out_lens for r in regions)))
-        raise_recompile_limit(n_lens * (batch_size.bit_length() + 1))
+        raise_recompile_limit(n_lens * (batch_size.bit_length() + 1)
+                              * inc.max_width_classes)
         forbid_eager_fallback()
     stats = []
     for region in regions:
