@@ -246,9 +246,12 @@ acceptor.
 
 What has been done to the incremental path, and what could come next.
 Gains are GPU time per variant on an H200 (reference + 499 random SNVs of
-100 kb). "Pending" means not measured yet; `sbatch
-benchmarks/h200_ablation.sbatch` measures each rewrite alone and on top of
-the others (`results/ablation-<job>/ablation.md`). The naive comparison
+100 kb, variant batch 32), measured by `sbatch
+benchmarks/h200_ablation.sbatch` (`results/ablation-<job>/ablation.md`;
+numbers below from job 16049223). *Alone* is `none` → only that rewrite;
+*on top* is all rewrites but that one → all of them. That job still had a
+`fused_junction` rewrite (one matmul for all junction heads); it was removed
+because it was slower (0.98×) and overflowed in FP16. The naive comparison
 (plain SpliceAI2 full passes, `Ensemble`) never uses any of these.
 
 ### Done
@@ -257,13 +260,18 @@ Exact rewrites (equal in exact arithmetic; `IncrementalEnsemble(...,
 opts=Optimizations(...))`, all on by default, `--opts` in
 `spliceai2-mutbench`):
 
-| Rewrite (`Optimizations` field) | What | Gain |
+| Rewrite (`Optimizations` field) | What | Gain (alone / on top) |
 |---|---|---|
-| incremental scheme (baseline) | recompute only each SNV's cone, ~1.3% of a full pass | 15× vs naive (382 vs 25.7 pred/s, batch 32) |
-| `stencil_resample` | linear upsample × p then avg-pool between blocks = 3-tap `[1/8, 3/4, 1/8]` filter (same pool) or stride-2 4-tap `[1/16, 7/16, 7/16, 1/16]` (pool doubles) at pooled resolution; no full-resolution activations | pending (those kernels were ~35% of variant time) |
-| `grouped_head_upsample` | splice-site heads summed per pooling factor (and over both models) before one upsampling: 5 upsamples instead of 40 | pending (~9%) |
-| `reference_depthwise` | reference pass token mixer as fused shifted products instead of PyTorch's generic dilated depthwise kernel | pending (that kernel was 23% of the reference pass) |
-| `padded_ffn` | FFN of windows with widths not a multiple of 8 (blocks 16-19) run zero-padded, so the 1x1 convolutions get aligned GEMMs instead of `align1` kernels | pending (those GEMMs were ~14%) |
+| incremental scheme (baseline) | recompute only each SNV's cone, ~1.3% of a full pass | 15× vs naive (382 vs 25.7 pred/s, 2.55 ms/variant) |
+| `stencil_resample` | linear upsample × p then avg-pool between blocks = 3-tap `[1/8, 3/4, 1/8]` filter (same pool) or stride-2 4-tap `[1/16, 7/16, 7/16, 1/16]` (pool doubles) at pooled resolution; no full-resolution activations | 1.95× / 2.33× |
+| `grouped_head_upsample` | splice-site heads summed per pooling factor (and over both models) before one upsampling: 5 upsamples instead of 40 | 1.03× / 1.08× |
+| `reference_depthwise` | reference pass token mixer as fused shifted products instead of PyTorch's generic dilated depthwise kernel | none per variant (it only changes the reference pass); reference pass 1.27× / 1.35× (38.9 → 30.6 ms alone, 34.0 → 25.1 ms on top) |
+| `padded_ffn` | FFN of windows with widths not a multiple of 8 (blocks 16-19) run zero-padded, so the 1x1 convolutions get aligned GEMMs instead of `align1` kernels | 1.16× / 1.34× |
+| all rewrites | | 2.72× (2.55 → 0.935 ms/variant, 1,017 pred/s), ~40× vs naive |
+
+Each rewrite gains more on top of the others than alone, because the
+others shrink the rest of the variant time. Against the unoptimized
+incremental path the rewrites change probabilities by at most 6e-5 (FP16).
 
 Settings:
 
@@ -271,8 +279,15 @@ Settings:
 |---|---|
 | variant batch 32 instead of `auto` (248 on an H200) | same throughput (2.54 ms/variant at 32, 2.59-2.62 at 256-499), 5.2 instead of 28-53 GiB peak memory |
 | `TORCHINDUCTOR_CACHE_DIR=.inductor_cache/` in the sbatch scripts | later jobs skip the ~150 s compile of each graph built before |
-| pinned, reused host buffers for end-to-end outputs (`--host-copy`, benchmark) | pending; end-to-end throughput dropped up to 3.8× in some runs with plain `.cpu()` |
-| Inductor freezing, `reduce-overhead` (CUDA graphs), `max-autotune-no-cudagraphs` (benchmark flags only) | pending |
+| pinned, reused host buffers for end-to-end outputs (`--host-copy`, benchmark) | 1.43× end-to-end (855 vs 596 pred/s; copy to host 0.06 vs 0.31 s); earlier runs with plain `.cpu()` dropped up to 3.8× |
+
+Compile settings on top of all rewrites (benchmark flags only):
+
+| Setting | Gain |
+|---|---|
+| `reduce-overhead` (CUDA graphs) | 1.03×; peak memory 1.9 instead of 4.7 GiB |
+| Inductor freezing | 0.98× (slower) |
+| `max-autotune-no-cudagraphs` | 0.92× (slower), 790 s compile |
 
 ### Possible later
 
@@ -281,7 +296,7 @@ Settings:
 | share reference-context gathers between SNVs with the same anchor (16 nt bin) | yes | ~1 ms of an ~80 ms batch; needs data-dependent shapes, which break the static compiled graphs |
 | reuse the reference's junction Q/K at sites outside each block's changed region | yes | complex bookkeeping (per block and SNV: changed sites, new top-k sites, row/column updates); the last 4 blocks change nearly every site anyway |
 | overlap GPU work with writing results in `spliceai2-ism` (writer thread) | yes | measure first: compare its logged SNVs/s with the benchmark's GPU rate |
-| CUDA graphs in `spliceai2-ism` | yes | only if `reduce-overhead` wins in the benchmark; needs the cache in persistent, static buffers |
+| CUDA graphs in `spliceai2-ism` | yes | `reduce-overhead` gained only 3% in the benchmark (plus lower peak memory); needs the cache in persistent, static buffers |
 | truncate the cone of the deepest blocks (e.g. to ±10 kb instead of ±56 kb) | no | most of the remaining work is in the last 4 blocks' wide windows; the error per cutoff would have to be measured against full passes |
 | skip the junction head for SNVs whose largest 1D delta is below `--min-delta` | no | junction deltas of such SNVs would be lost; only safe if they are not needed |
 
